@@ -1,20 +1,53 @@
 const QRCode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 const { query } = require("../config/database");
 const { generateSKU, validateSKU } = require("../services/skuService");
+const wsService = require("../services/wsService");
+
+const QR_DIR = path.join(__dirname, "..", "..", "uploads", "qr");
+
+// Deterministic model barcode: same type + same specs → same barcode always
+const _modelBarcode = (categoryId, specsObj) => {
+  const sorted = Object.fromEntries(
+    Object.entries(specsObj)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .sort(([a], [b]) => a.localeCompare(b))
+  );
+  const key = `${categoryId}||${JSON.stringify(sorted)}`;
+  const hash = crypto.createHash("sha1").update(key).digest("hex").slice(0, 10).toUpperCase();
+  return `MDL-${hash}`;
+};
+
+// Reusable SELECT columns for products with room/dept JOIN
+const PRODUCT_SELECT = `
+  p.*,
+  c.name  AS category_name,
+  r.name  AS room_name,  r.type AS room_type,
+  d.id    AS department_id, d.code AS department_code,
+  d.name  AS department_name, d.color AS department_color
+`;
+const PRODUCT_JOINS = `
+  LEFT JOIN categories  c ON p.category_id  = c.id
+  LEFT JOIN rooms       r ON p.room_id       = r.id
+  LEFT JOIN departments d ON r.department_id = d.id
+`;
 
 // GET /api/products
 const getProducts = async (req, res, next) => {
   try {
-    const { search, category_id, page = 1, limit = 20 } = req.query;
+    const { search, category_id, type, status, department, room_id, page = 1, limit = 20 } = req.query;
     const offset = (page - 1) * limit;
     const params = [req.user.id];
     let where = "p.user_id = $1";
     let idx = 2;
 
-    if (category_id) {
-      where += ` AND p.category_id = $${idx++}`;
-      params.push(category_id);
-    }
+    const typeFilter = type || category_id;
+    if (typeFilter) { where += ` AND p.category_id = $${idx++}`; params.push(typeFilter); }
+    if (status)     { where += ` AND p.status = $${idx++}`;      params.push(status); }
+    if (room_id)    { where += ` AND p.room_id = $${idx++}`;     params.push(room_id); }
+    if (department) { where += ` AND d.code = $${idx++}`;        params.push(department); }
     if (search) {
       where += ` AND (p.name ILIKE $${idx} OR p.sku ILIKE $${idx} OR p.barcode ILIKE $${idx})`;
       params.push(`%${search}%`);
@@ -22,15 +55,13 @@ const getProducts = async (req, res, next) => {
     }
 
     const countResult = await query(
-      `SELECT COUNT(*) FROM products p WHERE ${where}`,
+      `SELECT COUNT(*) FROM products p ${PRODUCT_JOINS} WHERE ${where}`,
       params
     );
     const total = Number(countResult.rows[0].count);
 
     const result = await query(
-      `SELECT p.*, c.name AS category_name
-       FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
+      `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS}
        WHERE ${where}
        ORDER BY p.created_at DESC
        LIMIT $${idx} OFFSET $${idx + 1}`,
@@ -51,9 +82,7 @@ const getProducts = async (req, res, next) => {
 const getProduct = async (req, res, next) => {
   try {
     const result = await query(
-      `SELECT p.*, c.name AS category_name
-       FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
+      `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS}
        WHERE p.id = $1 AND p.user_id = $2`,
       [req.params.id, req.user.id]
     );
@@ -71,6 +100,11 @@ const getProductByScan = async (req, res, next) => {
   try {
     const { id } = req.query;
     if (!id) return res.status(400).json({ success: false, message: "id required" });
+
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuidRegex.test(id)) {
+      return res.status(400).json({ success: false, message: "Invalid product ID" });
+    }
 
     const result = await query(
       `SELECT p.*, c.name AS category_name
@@ -93,7 +127,8 @@ const createProduct = async (req, res, next) => {
   try {
     const {
       name, sku: manualSku, type, barcode,
-      description, tags, quantity, price, storage_location,
+      description, tags, quantity, price, storage_location, status, specifications,
+      department, classroom, room_id,
     } = req.body;
 
     // SKU: use manual if provided and valid, otherwise auto-generate
@@ -111,26 +146,51 @@ const createProduct = async (req, res, next) => {
     const tagsArray = tags
       ? (Array.isArray(tags) ? tags : JSON.parse(tags))
       : null;
+    const specsJson = specifications
+      ? (typeof specifications === 'string' ? specifications : JSON.stringify(specifications))
+      : null;
+
+    // Auto-assign model barcode: same type + same specs → same barcode
+    let resolvedBarcode = barcode?.trim() || null;
+    if (!resolvedBarcode && specsJson && type) {
+      const specsObj = JSON.parse(specsJson);
+      if (Object.keys(specsObj).length > 0) {
+        resolvedBarcode = _modelBarcode(type, specsObj);
+      }
+    }
 
     const result = await query(
       `INSERT INTO products
-         (user_id, category_id, name, sku, barcode, description, tags, quantity, price, storage_location, photo_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         (user_id, category_id, name, sku, barcode, description, tags, quantity, price, storage_location, photo_url, status, specifications, department, classroom, room_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
        RETURNING *`,
       [
         req.user.id, type || null, name, sku,
-        barcode || null, description || null,
+        resolvedBarcode, description || null,
         tagsArray ? `{${tagsArray.join(",")}}` : null,
         quantity || 0, price || null, storage_location || null, photoUrl,
+        status || 'in_stock',
+        specsJson || null,
+        department || null, classroom || null, room_id || null,
       ]
     );
     const product = result.rows[0];
 
-    // Generate QR pointing to the public scan endpoint
+    // Generate QR PNG and save to disk
     const qrData = `${process.env.APP_URL}/api/products/scan?id=${product.id}`;
-    await query("UPDATE products SET qr_data=$1 WHERE id=$2", [qrData, product.id]);
+    const qrFilename = `${product.id}.png`;
+    const qrFilePath = path.join(QR_DIR, qrFilename);
+    const qrImageUrl = `/uploads/qr/${qrFilename}`;
 
-    res.status(201).json({ success: true, data: { ...product, qr_data: qrData } });
+    const qrBuffer = await QRCode.toBuffer(qrData, { width: 300 });
+    fs.writeFileSync(qrFilePath, qrBuffer);
+
+    await query(
+      "UPDATE products SET qr_data=$1, qr_image_url=$2 WHERE id=$3",
+      [qrData, qrImageUrl, product.id]
+    );
+
+    res.status(201).json({ success: true, data: { ...product, qr_data: qrData, qr_image_url: qrImageUrl } });
   } catch (err) {
     next(err);
   }
@@ -141,7 +201,8 @@ const updateProduct = async (req, res, next) => {
   try {
     const {
       name, sku: manualSku, type, barcode,
-      description, tags, quantity, price, storage_location,
+      description, tags, quantity, price, storage_location, status, specifications,
+      department, classroom, room_id,
     } = req.body;
 
     const existing = await query(
@@ -166,24 +227,144 @@ const updateProduct = async (req, res, next) => {
     const tagsArray = tags
       ? (Array.isArray(tags) ? tags : JSON.parse(tags))
       : null;
+    const specsJson = specifications
+      ? (typeof specifications === 'string' ? specifications : JSON.stringify(specifications))
+      : null;
+
+    // Auto-assign model barcode: same type + same specs → same barcode
+    const effectiveType = type || existing.rows[0].category_id;
+    const effectiveSpecsJson = specsJson ?? (existing.rows[0].specifications
+      ? JSON.stringify(existing.rows[0].specifications)
+      : null);
+    let resolvedBarcode = barcode?.trim() || null;
+    if (!resolvedBarcode && effectiveSpecsJson && effectiveType) {
+      const specsObj = JSON.parse(effectiveSpecsJson);
+      if (Object.keys(specsObj).length > 0) {
+        resolvedBarcode = _modelBarcode(effectiveType, specsObj);
+      }
+    }
 
     const result = await query(
       `UPDATE products
        SET name=$1, sku=$2, category_id=$3, barcode=$4, description=$5,
            tags=$6, quantity=$7, price=$8, storage_location=$9, photo_url=$10,
-           updated_at=NOW()
-       WHERE id=$11 AND user_id=$12
+           status=$11, specifications=$12, department=$13, classroom=$14,
+           room_id=$15, updated_at=NOW()
+       WHERE id=$16 AND user_id=$17
        RETURNING *`,
       [
         name, manualSku || existing.rows[0].sku, type || null,
-        barcode || null, description || null,
+        resolvedBarcode, description || null,
         tagsArray ? `{${tagsArray.join(",")}}` : null,
         quantity ?? existing.rows[0].quantity,
         price ?? existing.rows[0].price,
         storage_location || null, photoUrl,
+        status || existing.rows[0].status || 'in_stock',
+        specsJson ?? existing.rows[0].specifications ?? null,
+        department || existing.rows[0].department || null,
+        classroom || existing.rows[0].classroom || null,
+        room_id !== undefined ? (room_id || null) : existing.rows[0].room_id,
         req.params.id, req.user.id,
       ]
     );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PATCH /api/products/:id/location
+const updateProductLocation = async (req, res, next) => {
+  try {
+    const { room_id } = req.body;
+
+    if (room_id) {
+      const roomCheck = await query("SELECT id FROM rooms WHERE id = $1", [room_id]);
+      if (!roomCheck.rows.length) {
+        return res.status(400).json({ success: false, message: "Room not found" });
+      }
+    }
+
+    // Snapshot old room before update
+    const before = await query(
+      `SELECT p.name AS product_name, r.name AS room_name, d.code AS dept_code
+       FROM products p
+       LEFT JOIN rooms r ON p.room_id = r.id
+       LEFT JOIN departments d ON r.department_id = d.id
+       WHERE p.id = $1 AND p.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+
+    await query(
+      "UPDATE products SET room_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3",
+      [room_id || null, req.params.id, req.user.id]
+    );
+
+    // Return full product with room/dept data
+    const result = await query(
+      `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS}
+       WHERE p.id = $1 AND p.user_id = $2`,
+      [req.params.id, req.user.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const prod = result.rows[0];
+    const old  = before.rows[0] || {};
+
+    // Persist notification in database
+    const notifResult = await query(
+      `INSERT INTO notifications
+         (user_id, type, title, body, product_id, product_name, from_room, to_room)
+       VALUES ($1, 'product_moved', 'Déplacement effectué', $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [
+        req.user.id,
+        `${prod.name} → ${prod.room_name || '—'}`,
+        prod.id,
+        prod.name,
+        old.room_name  || null,
+        prod.room_name || null,
+      ]
+    );
+
+    // Notify via WebSocket (include DB notification id to avoid duplicates in Flutter)
+    wsService.sendToUser(req.user.id, {
+      type:           "product_moved",
+      notificationId: notifResult.rows[0].id,
+      productId:      prod.id,
+      productName:    prod.name,
+      fromRoom:       old.room_name  || null,
+      fromDept:       old.dept_code  || null,
+      toRoom:         prod.room_name || null,
+      toDept:         prod.department_code || null,
+      movedAt:        new Date().toISOString(),
+    });
+
+    res.json({ success: true, data: prod });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PATCH /api/products/:id/status
+const updateProductStatus = async (req, res, next) => {
+  try {
+    const { status } = req.body;
+    const allowed = ['in_stock', 'in_maintenance', 'critical_issue', 'retired'];
+    if (!status || !allowed.includes(status)) {
+      return res.status(400).json({ success: false, message: `status must be one of: ${allowed.join(', ')}` });
+    }
+
+    const result = await query(
+      `UPDATE products SET status=$1, updated_at=NOW()
+       WHERE id=$2 AND user_id=$3 RETURNING *`,
+      [status, req.params.id, req.user.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     next(err);
@@ -206,17 +387,35 @@ const deleteProduct = async (req, res, next) => {
   }
 };
 
-// GET /api/products/:id/qr  — returns QR as PNG image
+// GET /api/products/:id/qr  — serves saved QR PNG, regenerates if missing
 const getProductQR = async (req, res, next) => {
   try {
     const result = await query(
-      "SELECT qr_data FROM products WHERE id=$1 AND user_id=$2",
+      "SELECT qr_data, qr_image_url FROM products WHERE id=$1 AND user_id=$2",
       [req.params.id, req.user.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
-    const qrBuffer = await QRCode.toBuffer(result.rows[0].qr_data, { width: 300 });
+
+    const { qr_data, qr_image_url } = result.rows[0];
+
+    // Serve saved file if it exists
+    if (qr_image_url) {
+      const filePath = path.join(__dirname, "..", "..", qr_image_url);
+      if (fs.existsSync(filePath)) {
+        return res.sendFile(filePath);
+      }
+    }
+
+    // Fallback: regenerate and save for next time
+    const qrBuffer = await QRCode.toBuffer(qr_data, { width: 300 });
+    const qrFilename = `${req.params.id}.png`;
+    const qrFilePath = path.join(QR_DIR, qrFilename);
+    const newQrImageUrl = `/uploads/qr/${qrFilename}`;
+    fs.writeFileSync(qrFilePath, qrBuffer);
+    await query("UPDATE products SET qr_image_url=$1 WHERE id=$2", [newQrImageUrl, req.params.id]);
+
     res.set("Content-Type", "image/png");
     res.send(qrBuffer);
   } catch (err) {
@@ -244,11 +443,15 @@ const getStats = async (req, res, next) => {
     const [products, scans] = await Promise.all([
       query(
         `SELECT
-           COUNT(*)                                              AS total_products,
-           COUNT(*) FILTER (WHERE quantity = 0)                 AS out_of_stock,
-           COUNT(*) FILTER (WHERE quantity > 0 AND quantity <= 5) AS low_stock,
+           COUNT(*)                                                    AS total_products,
+           COUNT(*) FILTER (WHERE quantity = 0)                        AS out_of_stock,
+           COUNT(*) FILTER (WHERE quantity > 0 AND quantity <= 5)      AS low_stock,
            COUNT(DISTINCT category_id) FILTER (WHERE category_id IS NOT NULL) AS categories_used,
-           COALESCE(SUM(price * quantity), 0)                   AS total_value
+           COALESCE(SUM(price * quantity), 0)                          AS total_value,
+           COUNT(*) FILTER (WHERE status = 'in_stock')                 AS status_in_stock,
+           COUNT(*) FILTER (WHERE status = 'in_maintenance')           AS status_in_maintenance,
+           COUNT(*) FILTER (WHERE status = 'critical_issue')           AS status_critical_issue,
+           COUNT(*) FILTER (WHERE status = 'retired')                  AS status_retired
          FROM products WHERE user_id = $1`,
         [userId]
       ),
@@ -259,12 +462,16 @@ const getStats = async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        total_products:   Number(r.total_products),
-        out_of_stock:     Number(r.out_of_stock),
-        low_stock:        Number(r.low_stock),
-        categories_used:  Number(r.categories_used),
-        total_value:      parseFloat(Number(r.total_value).toFixed(2)),
-        total_scans:      Number(scans.rows[0].count),
+        total_products:        Number(r.total_products),
+        out_of_stock:          Number(r.out_of_stock),
+        low_stock:             Number(r.low_stock),
+        categories_used:       Number(r.categories_used),
+        total_value:           parseFloat(Number(r.total_value).toFixed(2)),
+        total_scans:           Number(scans.rows[0].count),
+        status_in_stock:       Number(r.status_in_stock),
+        status_in_maintenance: Number(r.status_in_maintenance),
+        status_critical_issue: Number(r.status_critical_issue),
+        status_retired:        Number(r.status_retired),
       },
     });
   } catch (err) {
@@ -272,16 +479,25 @@ const getStats = async (req, res, next) => {
   }
 };
 
-// POST /api/products/scan-history  — record a scan
+// POST /api/products/scan-history  — record a product scan/addition or department QR view
 const addScanHistory = async (req, res, next) => {
   try {
-    const { product_id } = req.body;
-    if (!product_id) return res.status(400).json({ success: false, message: "product_id required" });
-
-    await query(
-      "INSERT INTO scan_history (user_id, product_id) VALUES ($1, $2)",
-      [req.user.id, product_id]
-    );
+    const { product_id, department_code, department_name, action_type } = req.body;
+    if (!product_id && !department_code) {
+      return res.status(400).json({ success: false, message: "product_id or department_code required" });
+    }
+    if (product_id) {
+      const type = action_type || 'scan';
+      await query(
+        "INSERT INTO scan_history (user_id, product_id, action_type) VALUES ($1, $2, $3)",
+        [req.user.id, product_id, type]
+      );
+    } else {
+      await query(
+        "INSERT INTO scan_history (user_id, department_code, department_name, action_type) VALUES ($1, $2, $3, $4)",
+        [req.user.id, department_code, department_name || department_code, 'dept_qr']
+      );
+    }
     res.json({ success: true });
   } catch (err) {
     next(err);
@@ -293,10 +509,15 @@ const getScanHistory = async (req, res, next) => {
   try {
     const result = await query(
       `SELECT sh.id, sh.scanned_at,
-              p.id AS product_id, p.name, p.sku, p.photo_url,
-              c.name AS category_name
+              sh.action_type                        AS type,
+              sh.product_id,
+              COALESCE(p.name, sh.department_name)  AS name,
+              p.sku,
+              p.photo_url,
+              COALESCE(c.name, 'Département')       AS category_name,
+              sh.department_code
        FROM scan_history sh
-       JOIN products p ON sh.product_id = p.id
+       LEFT JOIN products p ON sh.product_id = p.id
        LEFT JOIN categories c ON p.category_id = c.id
        WHERE sh.user_id = $1
        ORDER BY sh.scanned_at DESC
@@ -309,9 +530,90 @@ const getScanHistory = async (req, res, next) => {
   }
 };
 
+// GET /api/products/dept-stats?department=I  (department code)
+const getDeptStats = async (req, res, next) => {
+  try {
+    const { department } = req.query;
+    if (!department) return res.status(400).json({ success: false, message: "department required" });
+
+    const deptRow = await query("SELECT id FROM departments WHERE code = $1", [department]);
+    if (!deptRow.rows.length) {
+      return res.status(404).json({ success: false, message: "Department not found" });
+    }
+    const deptId = deptRow.rows[0].id;
+
+    const result = await query(
+      `SELECT
+         COUNT(p.id)                                                        AS total,
+         COUNT(DISTINCT p.room_id) FILTER (WHERE p.room_id IS NOT NULL)    AS rooms_used,
+         COUNT(p.id) FILTER (WHERE p.status = 'in_stock')                  AS in_stock,
+         COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')            AS in_maintenance,
+         COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')            AS critical_issue,
+         COUNT(p.id) FILTER (WHERE p.status = 'retired')                   AS retired
+       FROM products p
+       JOIN rooms r ON p.room_id = r.id
+       WHERE p.user_id = $1 AND r.department_id = $2`,
+      [req.user.id, deptId]
+    );
+
+    const byRoom = await query(
+      `SELECT r.name AS room, COUNT(p.id) AS total
+       FROM rooms r
+       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
+       WHERE r.department_id = $2
+       GROUP BY r.id, r.name
+       ORDER BY r.name`,
+      [req.user.id, deptId]
+    );
+
+    const r = result.rows[0];
+    res.json({
+      success: true,
+      data: {
+        total:          Number(r.total),
+        rooms_used:     Number(r.rooms_used),
+        in_stock:       Number(r.in_stock),
+        in_maintenance: Number(r.in_maintenance),
+        critical_issue: Number(r.critical_issue),
+        retired:        Number(r.retired),
+        by_room: byRoom.rows.map(row => ({ room: row.room, total: Number(row.total) })),
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// GET /api/products/barcode-check?barcode=xxx
+const checkBarcode = async (req, res, next) => {
+  try {
+    const { barcode } = req.query;
+    if (!barcode) return res.status(400).json({ success: false, message: "barcode required" });
+
+    const result = await query(
+      `SELECT p.*, c.name AS category_name
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       WHERE p.barcode = $1 AND p.user_id = $2
+       ORDER BY p.created_at DESC
+       LIMIT 1`,
+      [barcode, req.user.id]
+    );
+
+    res.json({
+      success: true,
+      exists: result.rows.length > 0,
+      data: result.rows[0] || null,
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   getProducts, getProduct, getProductByScan,
-  createProduct, updateProduct, deleteProduct,
+  createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
   getProductQR, getCategories,
   addScanHistory, getScanHistory, getStats,
+  checkBarcode, getDeptStats,
 };

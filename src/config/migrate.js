@@ -51,6 +51,8 @@ const migrate = async () => {
       );
     `);
 
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_categories_name ON categories(name);`);
+
     // Seed default categories for ISET Mahdia
     await query(`
       INSERT INTO categories (name) VALUES
@@ -62,7 +64,7 @@ const migrate = async () => {
         ('Display'),
         ('Projector'),
         ('Machine Tool')
-      ON CONFLICT DO NOTHING;
+      ON CONFLICT (name) DO NOTHING;
     `);
 
     // Products table
@@ -81,6 +83,7 @@ const migrate = async () => {
         storage_location VARCHAR(200),
         photo_url VARCHAR(500),
         qr_data TEXT,
+        status VARCHAR(30) DEFAULT 'in_stock',
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
@@ -89,6 +92,84 @@ const migrate = async () => {
     await query(`CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_user ON products(user_id);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_category ON products(category_id);`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS qr_image_url VARCHAR(500);`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS specifications JSONB;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS department VARCHAR(10);`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS classroom VARCHAR(150);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_department ON products(department);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_classroom ON products(classroom);`);
+
+    // ── Departments ──────────────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS departments (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        code VARCHAR(10) UNIQUE NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        color VARCHAR(20) DEFAULT '#6366F1',
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await query(`
+      INSERT INTO departments (code, name, color) VALUES
+        ('I',   'Informatique',           '#3B5BDB'),
+        ('M',   'Mécanique',              '#F97316'),
+        ('G',   'Gestion',                '#16A34A'),
+        ('E',   'Électrique',             '#F59E0B'),
+        ('TC',  'Commerce Techniques',    '#00BFA5'),
+        ('ADM', 'Administration Générale','#7B1FA2')
+      ON CONFLICT (code) DO NOTHING;
+    `);
+
+    // ── Rooms ────────────────────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        department_id UUID REFERENCES departments(id) ON DELETE CASCADE,
+        name VARCHAR(150) NOT NULL,
+        type VARCHAR(20) DEFAULT 'classroom',
+        created_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (department_id, name)
+      );
+    `);
+
+    await query(`CREATE INDEX IF NOT EXISTS idx_rooms_department ON rooms(department_id);`);
+
+    // Seed rooms for each department
+    await query(`
+      INSERT INTO rooms (department_id, name, type)
+      SELECT d.id, r.name, r.type
+      FROM departments d
+      JOIN (VALUES
+        ('I', 'Salle I1', 'classroom'), ('I', 'Salle I2', 'classroom'),
+        ('I', 'Salle I3', 'classroom'), ('I', 'Salle I4', 'classroom'),
+        ('I', 'Salle I5', 'classroom'),
+        ('M', 'Salle M1', 'classroom'), ('M', 'Salle M2', 'classroom'),
+        ('M', 'Salle M3', 'classroom'), ('M', 'Salle M4', 'classroom'),
+        ('M', 'Salle M5', 'classroom'),
+        ('G', 'Salle G1', 'classroom'), ('G', 'Salle G2', 'classroom'),
+        ('G', 'Salle G3', 'classroom'), ('G', 'Salle G4', 'classroom'),
+        ('G', 'Salle G5', 'classroom'),
+        ('E',   'Salle E1',   'classroom'), ('E',   'Salle E2',   'classroom'),
+        ('E',   'Salle E3',   'classroom'), ('E',   'Salle E4',   'classroom'),
+        ('E',   'Salle E5',   'classroom'),
+        ('TC',  'Salle TC1',  'classroom'), ('TC',  'Salle TC2',  'classroom'),
+        ('TC',  'Salle TC3',  'classroom'), ('TC',  'Salle TC4',  'classroom'),
+        ('TC',  'Salle TC5',  'classroom'),
+        ('ADM', 'Salle ADM1', 'office'),    ('ADM', 'Salle ADM2', 'office')
+      ) AS r(code, name, type) ON d.code = r.code
+      ON CONFLICT (department_id, name) DO NOTHING;
+    `);
+
+    // Extra room metadata columns
+    await query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS room_code VARCHAR(20);`);
+    await query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS bloc VARCHAR(50);`);
+    await query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS floor VARCHAR(50);`);
+    await query(`ALTER TABLE rooms ADD COLUMN IF NOT EXISTS capacity INTEGER DEFAULT 30;`);
+
+    // Add room_id FK to products
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS room_id UUID REFERENCES rooms(id) ON DELETE SET NULL;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_room ON products(room_id);`);
 
     // Devices table (IoT / MQTT trackers)
     await query(`
@@ -132,6 +213,59 @@ const migrate = async () => {
 
     await query(`CREATE INDEX IF NOT EXISTS idx_scan_history_user ON scan_history(user_id);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_scan_history_product ON scan_history(product_id);`);
+
+    // Department QR history columns (idempotent)
+    await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS department_code TEXT;`);
+    await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS department_name TEXT;`);
+
+    // Action type: 'scan' | 'product_added' | 'dept_qr'
+    await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS action_type TEXT NOT NULL DEFAULT 'scan';`);
+
+    // Email verification tokens
+    await query(`
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_evt_user  ON email_verification_tokens(user_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_evt_token ON email_verification_tokens(token_hash);`);
+
+    // Password reset tokens
+    await query(`
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        token_hash VARCHAR(64) NOT NULL,
+        expires_at TIMESTAMP NOT NULL,
+        used BOOLEAN DEFAULT false,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_prt_user ON password_reset_tokens(user_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_prt_token ON password_reset_tokens(token_hash);`);
+
+    // Notifications table
+    await query(`
+      CREATE TABLE IF NOT EXISTS notifications (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(50) NOT NULL DEFAULT 'product_moved',
+        title VARCHAR(255),
+        body TEXT,
+        product_id UUID REFERENCES products(id) ON DELETE SET NULL,
+        product_name VARCHAR(255),
+        from_room VARCHAR(255),
+        to_room VARCHAR(255),
+        is_read BOOLEAN NOT NULL DEFAULT FALSE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, is_read);`);
 
     console.log("✅ Database migration completed");
     process.exit(0);

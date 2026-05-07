@@ -9,6 +9,9 @@ require("dotenv").config();
 const authRoutes = require("./routes/auth");
 const deviceRoutes = require("./routes/devices");
 const productRoutes = require("./routes/products");
+const departmentRoutes = require("./routes/departments");
+const reportRoutes = require("./routes/reports");
+const notificationRoutes = require("./routes/notifications");
 const { errorHandler, notFound } = require("./middleware/errorHandler");
 
 const app = express();
@@ -58,6 +61,9 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api/devices", deviceRoutes);
 app.use("/api/products", productRoutes);
+app.use("/api/departments", departmentRoutes);
+app.use("/api/reports", reportRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 // 404 & Error handlers
 app.use(notFound);
