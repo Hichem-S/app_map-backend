@@ -5,7 +5,7 @@ const {
   createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
   getProductQR, getCategories,
   addScanHistory, getScanHistory, getStats,
-  checkBarcode, getDeptStats,
+  checkBarcode, getDeptStats, getMoveLog,
 } = require("../controllers/productController");
 const { authenticate } = require("../middleware/auth");
 const upload = require("../middleware/upload");
@@ -22,6 +22,7 @@ router.use(authenticate);
 router.get("/stats", getStats);
 router.get("/dept-stats", getDeptStats);
 router.get("/barcode-check", checkBarcode);
+router.get("/move-log", getMoveLog);
 router.get("/scan-history", getScanHistory);
 router.post("/scan-history", addScanHistory);
 

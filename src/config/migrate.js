@@ -171,6 +171,11 @@ const migrate = async () => {
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS room_id UUID REFERENCES rooms(id) ON DELETE SET NULL;`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_room ON products(room_id);`);
 
+    // Track who last moved each product to a new location
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS last_moved_by UUID REFERENCES users(id) ON DELETE SET NULL;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS last_moved_at TIMESTAMP;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_last_moved_by ON products(last_moved_by);`);
+
     // Devices table (IoT / MQTT trackers)
     await query(`
       CREATE TABLE IF NOT EXISTS devices (
@@ -218,8 +223,10 @@ const migrate = async () => {
     await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS department_code TEXT;`);
     await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS department_name TEXT;`);
 
-    // Action type: 'scan' | 'product_added' | 'dept_qr'
+    // Action type: 'scan' | 'product_added' | 'dept_qr' | 'moved' | 'status_changed'
     await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS action_type TEXT NOT NULL DEFAULT 'scan';`);
+    // Extra context JSON: {"to_room":"Salle I2"} or {"new_status":"in_maintenance","old_status":"in_stock"}
+    await query(`ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS action_data TEXT;`);
 
     // Email verification tokens
     await query(`
@@ -266,6 +273,14 @@ const migrate = async () => {
     `);
     await query(`CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, is_read);`);
+
+    // ── AirTag-style tracker columns on products ──────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_active BOOLEAN DEFAULT false;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_lat DECIMAL(10,7);`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_lng DECIMAL(10,7);`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_battery INTEGER;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_checked_at TIMESTAMP;`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_tracker ON products(tracker_active) WHERE tracker_active = true;`);
 
     console.log("✅ Database migration completed");
     process.exit(0);

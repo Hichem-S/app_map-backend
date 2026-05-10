@@ -9,6 +9,20 @@ const users = [
 ];
 
 const seed = async () => {
+  const keepEmails = users.map(u => u.email);
+
+  // Delete all users not in the seed list
+  const deleted = await query(
+    `DELETE FROM users WHERE email != ALL($1) RETURNING email`,
+    [keepEmails]
+  );
+  if (deleted.rows.length) {
+    console.log(`Deleted ${deleted.rows.length} other user(s):`);
+    deleted.rows.forEach(r => console.log(`  - ${r.email}`));
+    console.log();
+  }
+
+  // Upsert the three seed users
   console.log("Seeding users...\n");
   for (const u of users) {
     const hashed = await bcrypt.hash(u.password, 12);
@@ -27,7 +41,7 @@ const seed = async () => {
     const row = res.rows[0];
     console.log(`✓  ${row.role.padEnd(12)} ${row.email}  /  password: ${u.password}`);
   }
-  console.log("\nDone. You can now log in with these accounts.");
+  console.log("\nDone. Only these 3 accounts exist now.");
   process.exit(0);
 };
 

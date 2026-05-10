@@ -12,6 +12,7 @@ const productRoutes = require("./routes/products");
 const departmentRoutes = require("./routes/departments");
 const reportRoutes = require("./routes/reports");
 const notificationRoutes = require("./routes/notifications");
+const trackerRoutes = require("./routes/trackers");
 const { errorHandler, notFound } = require("./middleware/errorHandler");
 
 const app = express();
@@ -28,11 +29,14 @@ app.use(
   })
 );
 
-// Rate limiting
+// Static files (uploads) — served BEFORE rate limiter so image loads don't count against the API limit
+app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
+
+// Rate limiting — applies to API routes only
 app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100,
+    max: 500,
     message: { success: false, message: "Too many requests, please try again later." },
   })
 );
@@ -43,9 +47,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // Logging
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
-
-// Static files (uploads)
-app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
 
 // Health check
 app.get("/health", (req, res) => {
@@ -64,6 +65,7 @@ app.use("/api/products", productRoutes);
 app.use("/api/departments", departmentRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/notifications", notificationRoutes);
+app.use("/api/trackers", trackerRoutes);
 
 // 404 & Error handlers
 app.use(notFound);

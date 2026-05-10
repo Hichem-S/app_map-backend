@@ -14,10 +14,10 @@ const getDepartments = async (req, res, next) => {
               COUNT(p.id)                                    AS product_count
        FROM departments d
        LEFT JOIN rooms r ON r.department_id = d.id
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
+       LEFT JOIN products p ON p.room_id = r.id
        GROUP BY d.id
        ORDER BY d.name`,
-      [req.user.id]
+      []
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -36,11 +36,11 @@ const getDepartmentRooms = async (req, res, next) => {
               COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue,
               COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired
        FROM rooms r
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
-       WHERE r.department_id = $2
+       LEFT JOIN products p ON p.room_id = r.id
+       WHERE r.department_id = $1
        GROUP BY r.id
        ORDER BY r.name`,
-      [req.user.id, req.params.id]
+      [req.params.id]
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -61,18 +61,18 @@ const getDepartmentStats = async (req, res, next) => {
          COUNT(p.id) FILTER (WHERE p.status = 'retired')                  AS retired
        FROM products p
        JOIN rooms r ON p.room_id = r.id
-       WHERE p.user_id = $1 AND r.department_id = $2`,
-      [req.user.id, req.params.id]
+       WHERE r.department_id = $1`,
+      [req.params.id]
     );
 
     const byRoom = await query(
       `SELECT r.name AS room, COUNT(p.id) AS total
        FROM rooms r
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
-       WHERE r.department_id = $2
+       LEFT JOIN products p ON p.room_id = r.id
+       WHERE r.department_id = $1
        GROUP BY r.id, r.name
        ORDER BY r.name`,
-      [req.user.id, req.params.id]
+      [req.params.id]
     );
 
     const r = summary.rows[0];
@@ -216,11 +216,11 @@ const getDepartmentRoomsByCode = async (req, res, next) => {
               COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue,
               COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired
        FROM rooms r
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
-       WHERE r.department_id = $2
+       LEFT JOIN products p ON p.room_id = r.id
+       WHERE r.department_id = $1
        GROUP BY r.id
        ORDER BY r.name`,
-      [req.user.id, deptRow.rows[0].id]
+      [deptRow.rows[0].id]
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -244,25 +244,36 @@ const getMapData = async (req, res, next) => {
          COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')        AS in_maintenance,
          COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue
        FROM rooms r
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
+       LEFT JOIN products p ON p.room_id = r.id
        GROUP BY r.id
        ORDER BY r.department_id, r.name`,
-      [req.user.id]
+      []
     );
 
-    // Fetch individual product markers
+    // Fetch individual product markers with last-mover info
     const prods = await query(
-      `SELECT id, name, sku, status, room_id
-       FROM products
-       WHERE user_id = $1 AND room_id IS NOT NULL
-       ORDER BY room_id, name`,
-      [req.user.id]
+      `SELECT p.id, p.name, p.sku, p.status, p.room_id,
+              p.last_moved_at,
+              u.name AS moved_by_name, u.role AS moved_by_role
+       FROM products p
+       LEFT JOIN users u ON u.id = p.last_moved_by
+       WHERE p.room_id IS NOT NULL
+       ORDER BY p.room_id, p.name`,
+      []
     );
 
     const prodsByRoom = {};
     for (const p of prods.rows) {
       if (!prodsByRoom[p.room_id]) prodsByRoom[p.room_id] = [];
-      prodsByRoom[p.room_id].push({ id: p.id, name: p.name, sku: p.sku || '', status: p.status });
+      prodsByRoom[p.room_id].push({
+        id:             p.id,
+        name:           p.name,
+        sku:            p.sku || '',
+        status:         p.status,
+        moved_by_name:  p.moved_by_name  || null,
+        moved_by_role:  p.moved_by_role  || null,
+        last_moved_at:  p.last_moved_at  ? p.last_moved_at.toISOString() : null,
+      });
     }
 
     const roomsByDept = {};

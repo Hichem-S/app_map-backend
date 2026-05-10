@@ -39,9 +39,9 @@ const getProducts = async (req, res, next) => {
   try {
     const { search, category_id, type, status, department, room_id, page = 1, limit = 20 } = req.query;
     const offset = (page - 1) * limit;
-    const params = [req.user.id];
-    let where = "p.user_id = $1";
-    let idx = 2;
+    const params = [];
+    let where = "1=1";
+    let idx = 1;
 
     const typeFilter = type || category_id;
     if (typeFilter) { where += ` AND p.category_id = $${idx++}`; params.push(typeFilter); }
@@ -83,8 +83,8 @@ const getProduct = async (req, res, next) => {
   try {
     const result = await query(
       `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS}
-       WHERE p.id = $1 AND p.user_id = $2`,
-      [req.params.id, req.user.id]
+       WHERE p.id = $1`,
+      [req.params.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -142,7 +142,11 @@ const createProduct = async (req, res, next) => {
       sku = await generateSKU(type);
     }
 
+    console.log('[CREATE] req.file =', req.file
+      ? { filename: req.file.filename, size: req.file.size, mimetype: req.file.mimetype }
+      : 'MISSING — no file received by multer');
     const photoUrl = req.file ? `/uploads/${req.file.filename}` : null;
+    console.log('[CREATE] photoUrl =', photoUrl);
     const tagsArray = tags
       ? (Array.isArray(tags) ? tags : JSON.parse(tags))
       : null;
@@ -190,6 +194,12 @@ const createProduct = async (req, res, next) => {
       [qrData, qrImageUrl, product.id]
     );
 
+    // Record activity
+    await query(
+      "INSERT INTO scan_history (user_id, product_id, action_type) VALUES ($1, $2, 'product_added')",
+      [req.user.id, product.id]
+    ).catch(() => {});
+
     res.status(201).json({ success: true, data: { ...product, qr_data: qrData, qr_image_url: qrImageUrl } });
   } catch (err) {
     next(err);
@@ -206,8 +216,8 @@ const updateProduct = async (req, res, next) => {
     } = req.body;
 
     const existing = await query(
-      "SELECT * FROM products WHERE id=$1 AND user_id=$2",
-      [req.params.id, req.user.id]
+      "SELECT * FROM products WHERE id=$1",
+      [req.params.id]
     );
     if (!existing.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -250,7 +260,7 @@ const updateProduct = async (req, res, next) => {
            tags=$6, quantity=$7, price=$8, storage_location=$9, photo_url=$10,
            status=$11, specifications=$12, department=$13, classroom=$14,
            room_id=$15, updated_at=NOW()
-       WHERE id=$16 AND user_id=$17
+       WHERE id=$16
        RETURNING *`,
       [
         name, manualSku || existing.rows[0].sku, type || null,
@@ -264,7 +274,7 @@ const updateProduct = async (req, res, next) => {
         department || existing.rows[0].department || null,
         classroom || existing.rows[0].classroom || null,
         room_id !== undefined ? (room_id || null) : existing.rows[0].room_id,
-        req.params.id, req.user.id,
+        req.params.id,
       ]
     );
     res.json({ success: true, data: result.rows[0] });
@@ -291,56 +301,89 @@ const updateProductLocation = async (req, res, next) => {
        FROM products p
        LEFT JOIN rooms r ON p.room_id = r.id
        LEFT JOIN departments d ON r.department_id = d.id
-       WHERE p.id = $1 AND p.user_id = $2`,
-      [req.params.id, req.user.id]
+       WHERE p.id = $1`,
+      [req.params.id]
     );
 
     await query(
-      "UPDATE products SET room_id=$1, updated_at=NOW() WHERE id=$2 AND user_id=$3",
-      [room_id || null, req.params.id, req.user.id]
+      "UPDATE products SET room_id=$1, last_moved_by=$2, last_moved_at=NOW(), updated_at=NOW() WHERE id=$3",
+      [room_id || null, req.user.id, req.params.id]
     );
 
     // Return full product with room/dept data
     const result = await query(
       `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS}
-       WHERE p.id = $1 AND p.user_id = $2`,
-      [req.params.id, req.user.id]
+       WHERE p.id = $1`,
+      [req.params.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
 
-    const prod = result.rows[0];
-    const old  = before.rows[0] || {};
+    const prod     = result.rows[0];
+    const old      = before.rows[0] || {};
+    const moverName = req.user.name || 'Unknown';
 
-    // Persist notification in database
-    const notifResult = await query(
+    const fromLabel = old.room_name  || '—';
+    const toLabel   = prod.room_name || '—';
+
+    const wsPayload = {
+      type:        "product_moved",
+      productId:   prod.id,
+      productName: prod.name,
+      fromRoom:    old.room_name         || null,
+      fromDept:    old.dept_code         || null,
+      toRoom:      prod.room_name        || null,
+      toDept:      prod.department_code  || null,
+      movedAt:     new Date().toISOString(),
+      movedByName: moverName,
+    };
+
+    // Self-notification (mover's own record)
+    const selfNotif = await query(
       `INSERT INTO notifications
          (user_id, type, title, body, product_id, product_name, from_room, to_room)
        VALUES ($1, 'product_moved', 'Déplacement effectué', $2, $3, $4, $5, $6)
        RETURNING id`,
-      [
-        req.user.id,
-        `${prod.name} → ${prod.room_name || '—'}`,
-        prod.id,
-        prod.name,
-        old.room_name  || null,
-        prod.room_name || null,
-      ]
+      [req.user.id, `By ${moverName}`,
+       prod.id, prod.name, old.room_name || null, prod.room_name || null]
+    );
+    wsService.sendToUser(req.user.id, {
+      ...wsPayload, notificationId: selfNotif.rows[0].id,
+    });
+
+    // Notify every technicien + admin who didn't perform the move
+    const recipients = await query(
+      `SELECT id FROM users
+       WHERE role IN ('technicien', 'admin') AND id != $1 AND is_active = true`,
+      [req.user.id]
     );
 
-    // Notify via WebSocket (include DB notification id to avoid duplicates in Flutter)
-    wsService.sendToUser(req.user.id, {
-      type:           "product_moved",
-      notificationId: notifResult.rows[0].id,
-      productId:      prod.id,
-      productName:    prod.name,
-      fromRoom:       old.room_name  || null,
-      fromDept:       old.dept_code  || null,
-      toRoom:         prod.room_name || null,
-      toDept:         prod.department_code || null,
-      movedAt:        new Date().toISOString(),
-    });
+    for (const r of recipients.rows) {
+      const notif = await query(
+        `INSERT INTO notifications
+           (user_id, type, title, body, product_id, product_name, from_room, to_room)
+         VALUES ($1, 'product_moved', 'Item Relocated', $2, $3, $4, $5, $6)
+         RETURNING id`,
+        [
+          r.id,
+          `By ${moverName}`,
+          prod.id, prod.name, old.room_name || null, prod.room_name || null,
+        ]
+      ).catch(() => null);
+
+      if (notif) {
+        wsService.sendToUser(r.id, {
+          ...wsPayload, notificationId: notif.rows[0].id,
+        });
+      }
+    }
+
+    // Record activity
+    await query(
+      "INSERT INTO scan_history (user_id, product_id, action_type, action_data) VALUES ($1, $2, 'moved', $3)",
+      [req.user.id, prod.id, JSON.stringify({ from_room: old.room_name || null, to_room: prod.room_name || null })]
+    ).catch(() => {});
 
     res.json({ success: true, data: prod });
   } catch (err) {
@@ -357,14 +400,24 @@ const updateProductStatus = async (req, res, next) => {
       return res.status(400).json({ success: false, message: `status must be one of: ${allowed.join(', ')}` });
     }
 
+    const before = await query("SELECT status FROM products WHERE id=$1", [req.params.id]);
+    const oldStatus = before.rows[0]?.status || null;
+
     const result = await query(
       `UPDATE products SET status=$1, updated_at=NOW()
-       WHERE id=$2 AND user_id=$3 RETURNING *`,
-      [status, req.params.id, req.user.id]
+       WHERE id=$2 RETURNING *`,
+      [status, req.params.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
+
+    // Record activity
+    await query(
+      "INSERT INTO scan_history (user_id, product_id, action_type, action_data) VALUES ($1, $2, 'status_changed', $3)",
+      [req.user.id, req.params.id, JSON.stringify({ old_status: oldStatus, new_status: status })]
+    ).catch(() => {});
+
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     next(err);
@@ -375,8 +428,8 @@ const updateProductStatus = async (req, res, next) => {
 const deleteProduct = async (req, res, next) => {
   try {
     const result = await query(
-      "DELETE FROM products WHERE id=$1 AND user_id=$2 RETURNING id",
-      [req.params.id, req.user.id]
+      "DELETE FROM products WHERE id=$1 RETURNING id",
+      [req.params.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -391,8 +444,8 @@ const deleteProduct = async (req, res, next) => {
 const getProductQR = async (req, res, next) => {
   try {
     const result = await query(
-      "SELECT qr_data, qr_image_url FROM products WHERE id=$1 AND user_id=$2",
-      [req.params.id, req.user.id]
+      "SELECT qr_data, qr_image_url FROM products WHERE id=$1",
+      [req.params.id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
@@ -452,8 +505,8 @@ const getStats = async (req, res, next) => {
            COUNT(*) FILTER (WHERE status = 'in_maintenance')           AS status_in_maintenance,
            COUNT(*) FILTER (WHERE status = 'critical_issue')           AS status_critical_issue,
            COUNT(*) FILTER (WHERE status = 'retired')                  AS status_retired
-         FROM products WHERE user_id = $1`,
-        [userId]
+         FROM products`,
+        []
       ),
       query('SELECT COUNT(*) FROM scan_history WHERE user_id = $1', [userId]),
     ]);
@@ -504,25 +557,28 @@ const addScanHistory = async (req, res, next) => {
   }
 };
 
-// GET /api/products/scan-history  — get recent scans for this user
+// GET /api/products/scan-history  — get recent activity across all users
 const getScanHistory = async (req, res, next) => {
   try {
     const result = await query(
       `SELECT sh.id, sh.scanned_at,
               sh.action_type                        AS type,
               sh.product_id,
+              sh.action_data,
               COALESCE(p.name, sh.department_name)  AS name,
               p.sku,
               p.photo_url,
               COALESCE(c.name, 'Département')       AS category_name,
-              sh.department_code
+              sh.department_code,
+              u.name                                AS user_name,
+              u.role                                AS user_role
        FROM scan_history sh
-       LEFT JOIN products p ON sh.product_id = p.id
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE sh.user_id = $1
+       LEFT JOIN products    p ON sh.product_id  = p.id
+       LEFT JOIN categories  c ON p.category_id  = c.id
+       LEFT JOIN users       u ON sh.user_id     = u.id
        ORDER BY sh.scanned_at DESC
-       LIMIT 20`,
-      [req.user.id]
+       LIMIT 30`,
+      []
     );
     res.json({ success: true, data: result.rows });
   } catch (err) {
@@ -552,18 +608,18 @@ const getDeptStats = async (req, res, next) => {
          COUNT(p.id) FILTER (WHERE p.status = 'retired')                   AS retired
        FROM products p
        JOIN rooms r ON p.room_id = r.id
-       WHERE p.user_id = $1 AND r.department_id = $2`,
-      [req.user.id, deptId]
+       WHERE r.department_id = $1`,
+      [deptId]
     );
 
     const byRoom = await query(
       `SELECT r.name AS room, COUNT(p.id) AS total
        FROM rooms r
-       LEFT JOIN products p ON p.room_id = r.id AND p.user_id = $1
-       WHERE r.department_id = $2
+       LEFT JOIN products p ON p.room_id = r.id
+       WHERE r.department_id = $1
        GROUP BY r.id, r.name
        ORDER BY r.name`,
-      [req.user.id, deptId]
+      [deptId]
     );
 
     const r = result.rows[0];
@@ -594,10 +650,10 @@ const checkBarcode = async (req, res, next) => {
       `SELECT p.*, c.name AS category_name
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.barcode = $1 AND p.user_id = $2
+       WHERE p.barcode = $1
        ORDER BY p.created_at DESC
        LIMIT 1`,
-      [barcode, req.user.id]
+      [barcode]
     );
 
     res.json({
@@ -610,10 +666,35 @@ const checkBarcode = async (req, res, next) => {
   }
 };
 
+// GET /api/products/move-log
+const getMoveLog = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT
+         p.id, p.name, p.sku, p.status,
+         p.last_moved_at,
+         r.id   AS room_id,   r.name AS room_name,
+         d.id   AS dept_id,   d.name AS dept_name,
+         d.code AS dept_code, d.color AS dept_color,
+         u.name AS moved_by_name, u.role AS moved_by_role
+       FROM products p
+       LEFT JOIN rooms r ON r.id = p.room_id
+       LEFT JOIN departments d ON d.id = r.department_id
+       LEFT JOIN users u ON u.id = p.last_moved_by
+       WHERE p.last_moved_at IS NOT NULL
+       ORDER BY p.last_moved_at DESC`,
+      []
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   getProducts, getProduct, getProductByScan,
   createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
-  getProductQR, getCategories,
+  getProductQR, getCategories, getMoveLog,
   addScanHistory, getScanHistory, getStats,
   checkBarcode, getDeptStats,
 };
