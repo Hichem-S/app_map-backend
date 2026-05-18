@@ -508,4 +508,34 @@ const toggleUserStatus = async (req, res, next) => {
   }
 };
 
-module.exports = { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser };
+// POST /api/auth/users  (admin only — creates user without email verification)
+const adminCreateUser = async (req, res, next) => {
+  try {
+    const { name, email, password, role } = req.body;
+    const allowedRoles = ['admin', 'magazinier', 'technicien'];
+    if (!name || !email || !password) {
+      return res.status(400).json({ success: false, message: 'Name, email and password are required' });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+    }
+    const userRole = allowedRoles.includes(role) ? role : 'technicien';
+
+    const exists = await query("SELECT id FROM users WHERE email = $1", [email]);
+    if (exists.rows.length) {
+      return res.status(409).json({ success: false, message: 'Email already in use' });
+    }
+
+    const hashed = await bcrypt.hash(password, 12);
+    const result = await query(
+      "INSERT INTO users (name, email, password, role, email_verified, is_active) VALUES ($1, $2, $3, $4, true, true) RETURNING id, name, email, role, is_active, created_at",
+      [name, email.toLowerCase(), hashed, userRole]
+    );
+
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser, adminCreateUser };
