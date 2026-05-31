@@ -32,9 +32,11 @@ const getDepartmentRooms = async (req, res, next) => {
       `SELECT r.*,
               COUNT(p.id)                                                    AS product_count,
               COUNT(p.id) FILTER (WHERE p.status = 'in_stock')              AS in_stock,
+              COUNT(p.id) FILTER (WHERE p.status = 'operational')           AS operational,
               COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')        AS in_maintenance,
               COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue,
-              COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired
+              COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired,
+              COUNT(p.id) FILTER (WHERE p.status = 'lost')                  AS lost
        FROM rooms r
        LEFT JOIN products p ON p.room_id = r.id
        WHERE r.department_id = $1
@@ -56,9 +58,11 @@ const getDepartmentStats = async (req, res, next) => {
          COUNT(p.id)                                                       AS total,
          COUNT(DISTINCT p.room_id) FILTER (WHERE p.room_id IS NOT NULL)   AS rooms_used,
          COUNT(p.id) FILTER (WHERE p.status = 'in_stock')                 AS in_stock,
+         COUNT(p.id) FILTER (WHERE p.status = 'operational')              AS operational,
          COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')           AS in_maintenance,
          COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')           AS critical_issue,
-         COUNT(p.id) FILTER (WHERE p.status = 'retired')                  AS retired
+         COUNT(p.id) FILTER (WHERE p.status = 'retired')                  AS retired,
+         COUNT(p.id) FILTER (WHERE p.status = 'lost')                     AS lost
        FROM products p
        JOIN rooms r ON p.room_id = r.id
        WHERE r.department_id = $1`,
@@ -82,9 +86,11 @@ const getDepartmentStats = async (req, res, next) => {
         total:          Number(r.total),
         rooms_used:     Number(r.rooms_used),
         in_stock:       Number(r.in_stock),
+        operational:    Number(r.operational),
         in_maintenance: Number(r.in_maintenance),
         critical_issue: Number(r.critical_issue),
         retired:        Number(r.retired),
+        lost:           Number(r.lost),
         by_room: byRoom.rows.map(row => ({
           room: row.room,
           total: Number(row.total),
@@ -212,9 +218,11 @@ const getDepartmentRoomsByCode = async (req, res, next) => {
       `SELECT r.*,
               COUNT(p.id)                                                    AS product_count,
               COUNT(p.id) FILTER (WHERE p.status = 'in_stock')              AS in_stock,
+              COUNT(p.id) FILTER (WHERE p.status = 'operational')           AS operational,
               COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')        AS in_maintenance,
               COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue,
-              COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired
+              COUNT(p.id) FILTER (WHERE p.status = 'retired')               AS retired,
+              COUNT(p.id) FILTER (WHERE p.status = 'lost')                  AS lost
        FROM rooms r
        LEFT JOIN products p ON p.room_id = r.id
        WHERE r.department_id = $1
@@ -241,8 +249,10 @@ const getMapData = async (req, res, next) => {
          r.id, r.name, r.type, r.department_id,
          COUNT(p.id)                                                    AS product_count,
          COUNT(p.id) FILTER (WHERE p.status = 'in_stock')              AS in_stock,
+         COUNT(p.id) FILTER (WHERE p.status = 'operational')           AS operational,
          COUNT(p.id) FILTER (WHERE p.status = 'in_maintenance')        AS in_maintenance,
-         COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue
+         COUNT(p.id) FILTER (WHERE p.status = 'critical_issue')        AS critical_issue,
+         COUNT(p.id) FILTER (WHERE p.status = 'lost')                  AS lost
        FROM rooms r
        LEFT JOIN products p ON p.room_id = r.id
        GROUP BY r.id

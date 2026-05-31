@@ -9,10 +9,12 @@ const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
   port: parseInt(process.env.SMTP_PORT || "587"),
   secure: false,
+  requireTLS: true,
   auth: {
     user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS,
+    pass: (process.env.SMTP_PASS || "").replace(/\s+/g, ""), // strip spaces from app password
   },
+  tls: { rejectUnauthorized: false },
 });
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
@@ -61,7 +63,7 @@ const sendVerificationOtp = async (userId, email, name) => {
     const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER;
     try {
       await mailer.sendMail({
-        from: `"Smart Inventory ISET" <${fromAddr}>`,
+        from: fromAddr,
         to: email,
         subject: "Verify your email address",
         html: `
@@ -78,8 +80,9 @@ const sendVerificationOtp = async (userId, email, name) => {
         `,
       });
       emailSent = true;
+      console.log(`✅ Verification email sent to ${email}`);
     } catch (mailErr) {
-      console.error("Verification mail failed:", mailErr.message);
+      console.error("❌ Verification mail failed:", mailErr.message);
     }
   }
 
@@ -90,7 +93,8 @@ const sendVerificationOtp = async (userId, email, name) => {
     console.log(`========================================\n`);
   }
 
-  return null;
+  const isDev = process.env.NODE_ENV !== "production";
+  return { emailSent, devOtp: isDev && !emailSent ? otp : null };
 };
 
 // POST /api/auth/register
@@ -112,9 +116,14 @@ const register = async (req, res, next) => {
     );
 
     const user = result.rows[0];
-    await sendVerificationOtp(user.id, email, name);
+    const { devOtp } = await sendVerificationOtp(user.id, email, name);
 
-    res.status(201).json({ success: true, requiresVerification: true, email });
+    res.status(201).json({
+      success: true,
+      requiresVerification: true,
+      email,
+      ...(devOtp ? { devOtp } : {}),
+    });
   } catch (err) {
     next(err);
   }
@@ -333,8 +342,12 @@ const resendVerification = async (req, res, next) => {
     }
 
     const user = userRes.rows[0];
-    await sendVerificationOtp(user.id, email, user.name);
-    res.json({ success: true, message: "Verification code resent." });
+    const { devOtp } = await sendVerificationOtp(user.id, email, user.name);
+    res.json({
+      success: true,
+      message: "Verification code resent.",
+      ...(devOtp ? { devOtp } : {}),
+    });
   } catch (err) {
     next(err);
   }
@@ -369,7 +382,7 @@ const forgotPassword = async (req, res, next) => {
       const fromAddr = process.env.SMTP_FROM || process.env.SMTP_USER;
       try {
         await mailer.sendMail({
-          from: `"Smart Inventory ISET" <${fromAddr}>`,
+          from: fromAddr,
           to: email,
           subject: "Your password reset code",
           html: `
@@ -386,16 +399,26 @@ const forgotPassword = async (req, res, next) => {
           `,
         });
         resetEmailSent = true;
+        console.log(`✅ Password reset email sent to ${email}`);
       } catch (mailErr) {
-        console.error("Mail send failed:", mailErr.message);
+        console.error("❌ Mail send failed:", mailErr.message);
       }
     }
 
+    const isDev = process.env.NODE_ENV !== "production";
     if (!resetEmailSent) {
       console.log(`[DEV] Password reset OTP for ${email}: ${otp}`);
     }
 
-    res.json({ success: true, message: "If that email exists, an OTP has been sent." });
+    res.json({
+      success: true,
+      message: resetEmailSent
+        ? "A reset code has been sent to your email."
+        : "Email delivery failed — use the code shown in the app.",
+      emailSent: resetEmailSent,
+      // Expose OTP only in development when email could not be sent
+      ...(isDev && !resetEmailSent ? { devOtp: otp } : {}),
+    });
   } catch (err) {
     next(err);
   }

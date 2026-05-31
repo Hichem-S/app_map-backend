@@ -107,14 +107,30 @@ const getProductByScan = async (req, res, next) => {
     }
 
     const result = await query(
-      `SELECT p.*, c.name AS category_name
-       FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.id = $1`,
+      `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS} WHERE p.id = $1`,
       [id]
     );
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// GET /api/products/rfid-scan?uid=xxx
+const getProductByRfid = async (req, res, next) => {
+  try {
+    const { uid } = req.query;
+    if (!uid) return res.status(400).json({ success: false, message: "uid required" });
+
+    const result = await query(
+      `SELECT ${PRODUCT_SELECT} FROM products p ${PRODUCT_JOINS} WHERE p.rfid_tag = $1 LIMIT 1`,
+      [uid]
+    );
+    if (!result.rows.length) {
+      return res.json({ success: false, message: "No product found with this RFID tag" });
     }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
@@ -212,7 +228,7 @@ const updateProduct = async (req, res, next) => {
     const {
       name, sku: manualSku, type, barcode,
       description, tags, quantity, price, storage_location, status, specifications,
-      department, classroom, room_id,
+      department, classroom, room_id, rfid_tag, ble_device,
     } = req.body;
 
     const existing = await query(
@@ -259,8 +275,8 @@ const updateProduct = async (req, res, next) => {
        SET name=$1, sku=$2, category_id=$3, barcode=$4, description=$5,
            tags=$6, quantity=$7, price=$8, storage_location=$9, photo_url=$10,
            status=$11, specifications=$12, department=$13, classroom=$14,
-           room_id=$15, updated_at=NOW()
-       WHERE id=$16
+           room_id=$15, rfid_tag=$16, ble_device=$17, updated_at=NOW()
+       WHERE id=$18
        RETURNING *`,
       [
         name, manualSku || existing.rows[0].sku, type || null,
@@ -274,6 +290,8 @@ const updateProduct = async (req, res, next) => {
         department || existing.rows[0].department || null,
         classroom || existing.rows[0].classroom || null,
         room_id !== undefined ? (room_id || null) : existing.rows[0].room_id,
+        rfid_tag !== undefined ? (rfid_tag || null) : existing.rows[0].rfid_tag,
+        ble_device !== undefined ? (ble_device || null) : existing.rows[0].ble_device,
         req.params.id,
       ]
     );
@@ -395,7 +413,7 @@ const updateProductLocation = async (req, res, next) => {
 const updateProductStatus = async (req, res, next) => {
   try {
     const { status } = req.body;
-    const allowed = ['in_stock', 'in_maintenance', 'critical_issue', 'retired'];
+    const allowed = ['in_stock', 'operational', 'in_maintenance', 'critical_issue', 'retired', 'lost'];
     if (!status || !allowed.includes(status)) {
       return res.status(400).json({ success: false, message: `status must be one of: ${allowed.join(', ')}` });
     }
@@ -417,6 +435,31 @@ const updateProductStatus = async (req, res, next) => {
       "INSERT INTO scan_history (user_id, product_id, action_type, action_data) VALUES ($1, $2, 'status_changed', $3)",
       [req.user.id, req.params.id, JSON.stringify({ old_status: oldStatus, new_status: status })]
     ).catch(() => {});
+
+    // Notify all magaziniers when an item is retired
+    if (status === 'retired') {
+      const product = result.rows[0];
+      const magaziniers = await query(
+        "SELECT id FROM users WHERE role = 'magazinier' AND is_active = true",
+        []
+      );
+      for (const mag of magaziniers.rows) {
+        const notif = await query(
+          `INSERT INTO notifications (user_id, type, title, body, product_id, product_name)
+           VALUES ($1, 'product_retired', 'Équipement réformé', $2, $3, $4)
+           RETURNING id`,
+          [mag.id, `${product.name} a été marqué comme réformé.`, product.id, product.name]
+        ).catch(() => ({ rows: [{}] }));
+        wsService.sendToUser(mag.id, {
+          type:           'product_retired',
+          notificationId: notif.rows[0]?.id,
+          productId:      product.id,
+          productName:    product.name,
+          title:          'Équipement réformé',
+          body:           `${product.name} a été marqué comme réformé.`,
+        });
+      }
+    }
 
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
@@ -502,9 +545,11 @@ const getStats = async (req, res, next) => {
            COUNT(DISTINCT category_id) FILTER (WHERE category_id IS NOT NULL) AS categories_used,
            COALESCE(SUM(price * quantity), 0)                          AS total_value,
            COUNT(*) FILTER (WHERE status = 'in_stock')                 AS status_in_stock,
+           COUNT(*) FILTER (WHERE status = 'operational')              AS status_operational,
            COUNT(*) FILTER (WHERE status = 'in_maintenance')           AS status_in_maintenance,
            COUNT(*) FILTER (WHERE status = 'critical_issue')           AS status_critical_issue,
-           COUNT(*) FILTER (WHERE status = 'retired')                  AS status_retired
+           COUNT(*) FILTER (WHERE status = 'retired')                  AS status_retired,
+           COUNT(*) FILTER (WHERE status = 'lost')                     AS status_lost
          FROM products`,
         []
       ),
@@ -522,9 +567,11 @@ const getStats = async (req, res, next) => {
         total_value:           parseFloat(Number(r.total_value).toFixed(2)),
         total_scans:           Number(scans.rows[0].count),
         status_in_stock:       Number(r.status_in_stock),
+        status_operational:    Number(r.status_operational),
         status_in_maintenance: Number(r.status_in_maintenance),
         status_critical_issue: Number(r.status_critical_issue),
         status_retired:        Number(r.status_retired),
+        status_lost:           Number(r.status_lost),
       },
     });
   } catch (err) {
@@ -691,10 +738,67 @@ const getMoveLog = async (req, res, next) => {
   }
 };
 
+// PATCH /api/products/:id/rfid  — assign or clear RFID / BLE tags
+const assignRfidTag = async (req, res, next) => {
+  try {
+    const { rfid_tag, ble_device } = req.body;
+
+    // Ensure at least one field is provided
+    if (rfid_tag === undefined && ble_device === undefined) {
+      return res.status(400).json({ success: false, message: "Provide rfid_tag and/or ble_device" });
+    }
+
+    // Check no other product already owns this tag
+    if (rfid_tag) {
+      const conflict = await query(
+        "SELECT id, name FROM products WHERE rfid_tag = $1 AND id <> $2 LIMIT 1",
+        [rfid_tag, req.params.id]
+      );
+      if (conflict.rows.length) {
+        return res.status(409).json({
+          success: false,
+          message: `RFID tag "${rfid_tag}" is already assigned to "${conflict.rows[0].name}"`,
+        });
+      }
+    }
+
+    if (ble_device) {
+      const conflict = await query(
+        "SELECT id, name FROM products WHERE ble_device = $1 AND id <> $2 LIMIT 1",
+        [ble_device, req.params.id]
+      );
+      if (conflict.rows.length) {
+        return res.status(409).json({
+          success: false,
+          message: `BLE device "${ble_device}" is already assigned to "${conflict.rows[0].name}"`,
+        });
+      }
+    }
+
+    const setClauses = [];
+    const values    = [];
+    if (rfid_tag  !== undefined) { setClauses.push(`rfid_tag=$${values.push(rfid_tag  || null)}`); }
+    if (ble_device !== undefined) { setClauses.push(`ble_device=$${values.push(ble_device || null)}`); }
+    setClauses.push(`updated_at=NOW()`);
+    values.push(req.params.id);
+
+    const result = await query(
+      `UPDATE products SET ${setClauses.join(", ")} WHERE id=$${values.length} RETURNING id, name, rfid_tag, ble_device`,
+      values
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
-  getProducts, getProduct, getProductByScan,
+  getProducts, getProduct, getProductByScan, getProductByRfid,
   createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
   getProductQR, getCategories, getMoveLog,
   addScanHistory, getScanHistory, getStats,
-  checkBarcode, getDeptStats,
+  checkBarcode, getDeptStats, assignRfidTag,
 };

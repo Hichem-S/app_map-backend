@@ -282,6 +282,105 @@ const migrate = async () => {
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_checked_at TIMESTAMP;`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_tracker ON products(tracker_active) WHERE tracker_active = true;`);
 
+    // ── BLE device linking ────────────────────────────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ble_device VARCHAR(50);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_ble ON products(ble_device) WHERE ble_device IS NOT NULL;`);
+
+    // RFID tag column + index
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS rfid_tag VARCHAR(100);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_products_rfid ON products(rfid_tag) WHERE rfid_tag IS NOT NULL;`);
+
+    // Unregistered RFID/BLE scans — tags not yet linked to any product
+    await query(`
+      CREATE TABLE IF NOT EXISTS unregistered_scans (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        uid         TEXT NOT NULL,
+        scan_type   TEXT NOT NULL DEFAULT 'rfid',
+        room_id     UUID REFERENCES rooms(id) ON DELETE SET NULL,
+        room_name   TEXT,
+        reader_id   TEXT,
+        scanned_at  TIMESTAMP DEFAULT NOW(),
+        resolved    BOOLEAN DEFAULT FALSE,
+        resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        resolved_at TIMESTAMP,
+        product_id  UUID REFERENCES products(id) ON DELETE SET NULL
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_unreg_uid      ON unregistered_scans(uid);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_unreg_resolved ON unregistered_scans(resolved);`);
+
+    // ── Messenger ─────────────────────────────────────────────────────────────
+    await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP;`);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        type       VARCHAR(10) NOT NULL DEFAULT 'direct',
+        name       VARCHAR(100),
+        created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_members (
+        conversation_id UUID REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
+        last_read_at    TIMESTAMP DEFAULT NOW(),
+        joined_at       TIMESTAMP DEFAULT NOW(),
+        PRIMARY KEY (conversation_id, user_id)
+      );
+    `);
+
+    await query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        conversation_id UUID REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        sender_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+        content         TEXT NOT NULL,
+        created_at      TIMESTAMP DEFAULT NOW()
+      );
+    `);
+
+    await query(`CREATE INDEX IF NOT EXISTS idx_chat_msgs_conv ON chat_messages(conversation_id, created_at DESC);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_chat_members_user ON chat_members(user_id);`);
+
+    // ── Checkouts ─────────────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS checkouts (
+        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        product_id  UUID REFERENCES products(id) ON DELETE CASCADE,
+        user_id     UUID REFERENCES users(id) ON DELETE SET NULL,
+        approved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+        status      TEXT NOT NULL DEFAULT 'pending',
+        due_date    DATE,
+        returned_at TIMESTAMP,
+        notes       TEXT,
+        created_at  TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_checkouts_product ON checkouts(product_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_checkouts_user    ON checkouts(user_id);`);
+
+    // ── Maintenance tasks ─────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS maintenance_tasks (
+        id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        product_id     UUID REFERENCES products(id) ON DELETE CASCADE,
+        created_by     UUID REFERENCES users(id) ON DELETE SET NULL,
+        assigned_to    UUID REFERENCES users(id) ON DELETE SET NULL,
+        title          TEXT NOT NULL,
+        description    TEXT,
+        priority       TEXT NOT NULL DEFAULT 'medium',
+        status         TEXT NOT NULL DEFAULT 'scheduled',
+        scheduled_date DATE,
+        completed_at   TIMESTAMP,
+        created_at     TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_maint_product ON maintenance_tasks(product_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_maint_assigned ON maintenance_tasks(assigned_to);`);
+
     console.log("✅ Database migration completed");
     process.exit(0);
   } catch (err) {

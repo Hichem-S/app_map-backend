@@ -13,6 +13,11 @@ const departmentRoutes = require("./routes/departments");
 const reportRoutes = require("./routes/reports");
 const notificationRoutes = require("./routes/notifications");
 const trackerRoutes = require("./routes/trackers");
+const iotRoutes     = require("./routes/iot");
+const messageRoutes = require("./routes/messages");
+const aiRoutes         = require("./routes/ai");
+const checkoutRoutes   = require("./routes/checkouts");
+const maintenanceRoutes = require("./routes/maintenance");
 const { errorHandler, notFound } = require("./middleware/errorHandler");
 
 const app = express();
@@ -66,6 +71,11 @@ app.use("/api/departments", departmentRoutes);
 app.use("/api/reports", reportRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/trackers", trackerRoutes);
+app.use("/api/iot",      iotRoutes);
+app.use("/api/messages", messageRoutes);
+app.use("/api/ai",          aiRoutes);
+app.use("/api/checkouts",   checkoutRoutes);
+app.use("/api/maintenance", maintenanceRoutes);
 
 // 404 & Error handlers
 app.use(notFound);

@@ -2,10 +2,12 @@ const PDFDocument = require("pdfkit");
 const { query } = require("../config/database");
 
 const STATUS_LABELS = {
-  in_stock:       "Opérationnel",
+  in_stock:       "En stock",
+  operational:    "Opérationnel",
   in_maintenance: "Maintenance",
   critical_issue: "Défectueux",
   retired:        "Réformé",
+  lost:           "Perdu",
 };
 
 const TYPE_LABELS = {
@@ -140,7 +142,7 @@ const getRoomFiche = async (req, res, next) => {
     const products = prodRes.rows;
 
     // Stats
-    const stats = { total: products.length, in_stock: 0, in_maintenance: 0, critical_issue: 0, retired: 0 };
+    const stats = { total: products.length, in_stock: 0, operational: 0, in_maintenance: 0, critical_issue: 0, retired: 0, lost: 0 };
     products.forEach(p => { if (stats[p.status] !== undefined) stats[p.status]++; });
 
     const dateStr = formatDate(new Date());

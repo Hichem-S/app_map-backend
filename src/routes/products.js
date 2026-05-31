@@ -1,11 +1,11 @@
 const express = require("express");
 const router = express.Router();
 const {
-  getProducts, getProduct, getProductByScan,
+  getProducts, getProduct, getProductByScan, getProductByRfid,
   createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
   getProductQR, getCategories,
   addScanHistory, getScanHistory, getStats,
-  checkBarcode, getDeptStats, getMoveLog,
+  checkBarcode, getDeptStats, getMoveLog, assignRfidTag,
 } = require("../controllers/productController");
 const { authenticate } = require("../middleware/auth");
 const upload = require("../middleware/upload");
@@ -22,6 +22,7 @@ router.use(authenticate);
 router.get("/stats", getStats);
 router.get("/dept-stats", getDeptStats);
 router.get("/barcode-check", checkBarcode);
+router.get("/rfid-scan", getProductByRfid);
 router.get("/move-log", getMoveLog);
 router.get("/scan-history", getScanHistory);
 router.post("/scan-history", addScanHistory);
@@ -32,6 +33,7 @@ router.get("/:id", getProduct);
 router.put("/:id", upload.single("photo"), updateProduct);
 router.patch("/:id/status", updateProductStatus);
 router.patch("/:id/location", updateProductLocation);
+router.patch("/:id/rfid", assignRfidTag);
 router.delete("/:id", deleteProduct);
 router.get("/:id/qr", getProductQR);
 

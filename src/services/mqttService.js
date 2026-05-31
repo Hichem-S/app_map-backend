@@ -1,5 +1,7 @@
 const mqtt = require("mqtt");
 const { query } = require("../config/database");
+// Lazy-require to avoid circular dependency at module load time
+const getIotController = () => require("../controllers/iotController");
 
 let client = null;
 
@@ -21,25 +23,72 @@ const connect = () => {
 
   client.on("connect", () => {
     console.log("✅ MQTT connected to", url);
-    // Subscribe to all device topics
+
+    // Generic device topics
     client.subscribe("devices/#", (err) => {
       if (err) console.error("MQTT subscribe error:", err);
       else console.log("📡 Subscribed to devices/#");
     });
+
+    // IoT inventory topics
+    client.subscribe("inventory/rfid", (err) => {
+      if (!err) console.log("📡 Subscribed to inventory/rfid");
+    });
+    client.subscribe("inventory/ble", (err) => {
+      if (!err) console.log("📡 Subscribed to inventory/ble");
+    });
+    client.subscribe("inventory/devices/#", (err) => {
+      if (!err) console.log("📡 Subscribed to inventory/devices/#");
+    });
   });
 
   client.on("message", async (topic, message) => {
+    let payload;
     try {
-      const payload = JSON.parse(message.toString());
-      console.log(`📨 MQTT [${topic}]:`, payload);
+      payload = JSON.parse(message.toString());
+    } catch {
+      // non-JSON message — ignore
+      return;
+    }
 
-      // Save message to DB
+    console.log(`📨 MQTT [${topic}]:`, payload);
+
+    // ── Persist raw message ───────────────────────────────────────────────
+    try {
       await query(
         "INSERT INTO messages (topic, payload) VALUES ($1, $2)",
         [topic, JSON.stringify(payload)]
       );
+    } catch (err) {
+      console.error("MQTT persist error:", err.message);
+    }
 
-      // Update device status if topic matches pattern: devices/{deviceId}/status
+    // ── Route by topic ────────────────────────────────────────────────────
+    try {
+      const { handleRfidScan, handleBleScan } = getIotController();
+
+      if (topic === "inventory/rfid") {
+        await handleRfidScan(payload);
+        return;
+      }
+
+      if (topic === "inventory/ble") {
+        await handleBleScan(payload);
+        return;
+      }
+
+      // inventory/devices/{readerId}/status — update device table
+      const invParts = topic.split("/");
+      if (invParts[0] === "inventory" && invParts[1] === "devices" && invParts[3] === "status") {
+        const readerId = invParts[2];
+        await query(
+          "UPDATE devices SET status = $1, last_seen = NOW() WHERE mqtt_topic LIKE $2",
+          [payload.status || "online", `%${readerId}%`]
+        );
+        return;
+      }
+
+      // devices/{deviceId}/status — legacy
       const parts = topic.split("/");
       if (parts.length === 3 && parts[0] === "devices" && parts[2] === "status") {
         const deviceId = parts[1];
