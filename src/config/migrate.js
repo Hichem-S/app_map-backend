@@ -282,6 +282,10 @@ const migrate = async () => {
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_checked_at TIMESTAMP;`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_tracker ON products(tracker_active) WHERE tracker_active = true;`);
 
+    // ── AirTag FindMy key link ────────────────────────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_hashed_key TEXT;`);
+    await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tracker_key ON products(tracker_hashed_key) WHERE tracker_hashed_key IS NOT NULL;`);
+
     // ── BLE device linking ────────────────────────────────────────────────────
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ble_device VARCHAR(50);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_ble ON products(ble_device) WHERE ble_device IS NOT NULL;`);
@@ -380,6 +384,47 @@ const migrate = async () => {
     `);
     await query(`CREATE INDEX IF NOT EXISTS idx_maint_product ON maintenance_tasks(product_id);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_maint_assigned ON maintenance_tasks(assigned_to);`);
+
+    // ── Maintenance notes ─────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS maintenance_notes (
+        id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        task_id    UUID REFERENCES maintenance_tasks(id) ON DELETE CASCADE,
+        user_id    UUID REFERENCES users(id) ON DELETE SET NULL,
+        note       TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_notes_task ON maintenance_notes(task_id);`);
+
+    // ── Low stock threshold ───────────────────────────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS low_stock_threshold INTEGER DEFAULT 1;`);
+
+    // ── Transfer requests ─────────────────────────────────────────────────────
+    await query(`
+      CREATE TABLE IF NOT EXISTS transfer_requests (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        product_id    UUID REFERENCES products(id) ON DELETE CASCADE,
+        requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+        from_room_id  UUID REFERENCES rooms(id) ON DELETE SET NULL,
+        to_room_id    UUID REFERENCES rooms(id) ON DELETE SET NULL,
+        status        TEXT NOT NULL DEFAULT 'pending',
+        notes         TEXT,
+        resolved_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+        resolved_at   TIMESTAMP,
+        created_at    TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await query(`CREATE INDEX IF NOT EXISTS idx_transfer_product ON transfer_requests(product_id);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_transfer_user    ON transfer_requests(requested_by);`);
+
+    // ── Warranty & lifecycle fields ───────────────────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS purchase_date   DATE;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS warranty_expiry DATE;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS end_of_life_date DATE;`);
+
+    // ── Recurring maintenance ─────────────────────────────────────────────────
+    await query(`ALTER TABLE maintenance_tasks ADD COLUMN IF NOT EXISTS recurrence_interval_days INTEGER;`);
 
     console.log("✅ Database migration completed");
     process.exit(0);

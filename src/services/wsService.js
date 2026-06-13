@@ -3,54 +3,50 @@ const jwt = require("jsonwebtoken");
 const { query } = require("../config/database");
 
 let wss = null;
-const clients = new Map();    // userId -> Set of ws connections
+const clients = new Map();     // userId -> Set of ws connections
 const onlineUsers = new Set(); // userId strings currently connected
+
+// How long an unauthenticated connection may stay open before being closed
+const AUTH_TIMEOUT_MS = 5000;
 
 const init = (server) => {
   wss = new WebSocket.Server({ server });
 
-  wss.on("connection", (ws, req) => {
+  wss.on("connection", (ws) => {
     console.log("🔌 WebSocket client connected");
 
-    const url = new URL(req.url, "http://localhost");
-    const token = url.searchParams.get("token");
-
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        ws.userId = decoded.id;
-
-        if (!clients.has(decoded.id)) clients.set(decoded.id, new Set());
-        clients.get(decoded.id).add(ws);
-
-        // Mark online and broadcast presence
-        const wasOffline = !onlineUsers.has(decoded.id);
-        onlineUsers.add(decoded.id);
-        if (wasOffline) {
-          broadcast({ type: "user_online", user_id: decoded.id }, decoded.id);
-        }
-
-        ws.send(JSON.stringify({ type: "connected", message: "Authenticated successfully" }));
-        console.log(`✅ WS authenticated: user ${decoded.id}`);
-      } catch {
-        ws.send(JSON.stringify({ type: "error", message: "Invalid token" }));
+    // Close unauthenticated connections after timeout
+    const authTimeout = setTimeout(() => {
+      if (!ws.userId) {
+        ws.send(JSON.stringify({ type: "error", message: "Authentication timeout" }));
         ws.close();
-        return;
       }
-    } else {
-      ws.send(JSON.stringify({ type: "warning", message: "No token - unauthenticated connection" }));
-    }
+    }, AUTH_TIMEOUT_MS);
 
     ws.on("message", (data) => {
+      let msg;
       try {
-        const msg = JSON.parse(data);
-        handleClientMessage(ws, msg);
+        msg = JSON.parse(data);
       } catch {
         ws.send(JSON.stringify({ type: "error", message: "Invalid JSON" }));
+        return;
       }
+
+      // First message must be auth
+      if (!ws.userId) {
+        if (msg.type !== "auth" || !msg.token) {
+          ws.send(JSON.stringify({ type: "error", message: "Send auth message first" }));
+          return;
+        }
+        _authenticate(ws, msg.token, authTimeout);
+        return;
+      }
+
+      handleClientMessage(ws, msg);
     });
 
     ws.on("close", () => {
+      clearTimeout(authTimeout);
       if (ws.userId) {
         const userConns = clients.get(ws.userId);
         if (userConns) {
@@ -58,7 +54,6 @@ const init = (server) => {
           if (userConns.size === 0) {
             clients.delete(ws.userId);
             onlineUsers.delete(ws.userId);
-            // Save last_seen
             query("UPDATE users SET last_seen = NOW() WHERE id = $1", [ws.userId]).catch(() => {});
             broadcast({ type: "user_offline", user_id: ws.userId });
           }
@@ -70,8 +65,31 @@ const init = (server) => {
     ws.on("error", (err) => console.error("WS error:", err));
   });
 
-  console.log(`✅ WebSocket server attached`);
+  console.log("✅ WebSocket server attached");
   return wss;
+};
+
+const _authenticate = (ws, token, authTimeout) => {
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    clearTimeout(authTimeout);
+
+    ws.userId = decoded.id;
+    if (!clients.has(decoded.id)) clients.set(decoded.id, new Set());
+    clients.get(decoded.id).add(ws);
+
+    const wasOffline = !onlineUsers.has(decoded.id);
+    onlineUsers.add(decoded.id);
+    if (wasOffline) {
+      broadcast({ type: "user_online", user_id: decoded.id }, decoded.id);
+    }
+
+    ws.send(JSON.stringify({ type: "connected", message: "Authenticated successfully" }));
+    console.log(`✅ WS authenticated: user ${decoded.id}`);
+  } catch {
+    ws.send(JSON.stringify({ type: "error", message: "Invalid token" }));
+    ws.close();
+  }
 };
 
 const handleClientMessage = (ws, msg) => {

@@ -88,4 +88,59 @@ const assignUnregistered = async (req, res, next) => {
   }
 };
 
-module.exports = { getUnregistered, assignUnregistered };
+// GET /api/iot/scan-history
+const getScanHistory = async (req, res, next) => {
+  try {
+    const { scan_type, limit = 100, offset = 0 } = req.query;
+
+    const params = [];
+    let scanTypeFilter = '';
+    if (scan_type === 'rfid' || scan_type === 'ble') {
+      params.push(scan_type);
+      scanTypeFilter = `AND (sh.action_data::jsonb)->>'scan_type' = $${params.length}`;
+    }
+
+    params.push(Number(limit), Number(offset));
+
+    const result = await query(
+      `SELECT
+         sh.id,
+         sh.product_id,
+         p.name  AS product_name,
+         p.sku,
+         (sh.action_data::jsonb)->>'scan_type'  AS scan_type,
+         (sh.action_data::jsonb)->>'identifier' AS identifier,
+         (sh.action_data::jsonb)->>'reader_id'  AS reader_id,
+         (sh.action_data::jsonb)->>'room_name'  AS room_name,
+         (sh.action_data::jsonb)->>'from_room'  AS from_room,
+         ((sh.action_data::jsonb)->>'moved')::boolean AS moved,
+         ((sh.action_data::jsonb)->>'rssi')::int  AS rssi,
+         sh.scanned_at
+       FROM scan_history sh
+       LEFT JOIN products p ON p.id = sh.product_id
+       WHERE sh.action_type = 'iot_scan'
+       ${scanTypeFilter}
+       ORDER BY sh.scanned_at DESC
+       LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+
+    const countParams = scan_type ? [scan_type] : [];
+    const countFilter = scan_type ? `AND (action_data::jsonb)->>'scan_type' = $1` : '';
+    const countRes = await query(
+      `SELECT COUNT(*) FROM scan_history
+       WHERE action_type = 'iot_scan' ${countFilter}`,
+      countParams
+    );
+
+    res.json({
+      success: true,
+      data: result.rows,
+      total: parseInt(countRes.rows[0].count, 10),
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getUnregistered, assignUnregistered, getScanHistory };

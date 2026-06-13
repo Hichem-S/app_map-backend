@@ -8,7 +8,8 @@ const getTrackers = async (req, res, next) => {
       `SELECT
          p.id, p.name, p.sku, p.status, p.photo_url,
          p.tracker_lat, p.tracker_lng, p.tracker_battery,
-         p.tracker_checked_at, p.tracker_active,
+         p.tracker_checked_at, p.tracker_active, p.ble_device,
+         p.tracker_hashed_key,
          r.id   AS room_id,   r.name AS room_name,
          d.id   AS dept_id,   d.name AS dept_name,
          d.code AS dept_code, d.color AS dept_color,
@@ -19,7 +20,7 @@ const getTrackers = async (req, res, next) => {
        LEFT JOIN departments d ON d.id = r.department_id
        LEFT JOIN categories  c ON c.id = p.category_id
        LEFT JOIN users       u ON u.id = p.last_moved_by
-       WHERE p.tracker_active = true OR p.room_id IS NOT NULL
+       WHERE p.tracker_hashed_key IS NOT NULL OR p.tracker_active = true
        ORDER BY p.tracker_checked_at DESC NULLS LAST, p.name ASC`,
       []
     );
@@ -106,4 +107,69 @@ const toggleTracker = async (req, res, next) => {
   }
 };
 
-module.exports = { getTrackers, checkIn, pingDevice, toggleTracker };
+// PATCH /api/trackers/:id/link  { hashed_key, ble_mac? }
+const linkTracker = async (req, res, next) => {
+  try {
+    const { hashed_key, ble_mac } = req.body;
+    if (!hashed_key) {
+      return res.status(400).json({ success: false, message: 'hashed_key required' });
+    }
+
+    // Ensure the key isn't already linked to another product
+    const conflict = await query(
+      `SELECT id, name FROM products WHERE tracker_hashed_key = $1 AND id <> $2 LIMIT 1`,
+      [hashed_key, req.params.id]
+    );
+    if (conflict.rows.length) {
+      return res.status(409).json({
+        success: false,
+        message: `Key already linked to "${conflict.rows[0].name}"`,
+      });
+    }
+
+    const updates = ['tracker_hashed_key = $1', 'tracker_active = true', 'updated_at = NOW()'];
+    const params  = [hashed_key];
+
+    if (ble_mac) {
+      params.push(ble_mac.toLowerCase());
+      updates.push(`ble_device = $${params.length}`);
+    }
+
+    params.push(req.params.id);
+    const result = await query(
+      `UPDATE products SET ${updates.join(', ')} WHERE id = $${params.length}
+       RETURNING id, name, sku, tracker_hashed_key, ble_device, tracker_active`,
+      params
+    );
+
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// DELETE /api/trackers/:id/link
+const unlinkTracker = async (req, res, next) => {
+  try {
+    await query(
+      `UPDATE products
+       SET tracker_hashed_key = NULL,
+           tracker_active      = false,
+           tracker_lat         = NULL,
+           tracker_lng         = NULL,
+           tracker_battery     = NULL,
+           tracker_checked_at  = NULL,
+           updated_at          = NOW()
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getTrackers, checkIn, pingDevice, toggleTracker, linkTracker, unlinkTracker };

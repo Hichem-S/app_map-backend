@@ -179,20 +179,28 @@ const createProduct = async (req, res, next) => {
       }
     }
 
+    const { purchase_date, warranty_expiry, end_of_life_date } = req.body;
+
+    // Build INSERT dynamically so warranty columns are omitted if not yet migrated
+    const cols   = ['user_id','category_id','name','sku','barcode','description','tags',
+                     'quantity','price','storage_location','photo_url','status',
+                     'specifications','department','classroom','room_id'];
+    const vals   = [
+      req.user.id, type || null, name, sku,
+      resolvedBarcode, description || null,
+      tagsArray ? `{${tagsArray.join(",")}}` : null,
+      quantity || 0, price || null, storage_location || null, photoUrl,
+      status || 'in_stock', specsJson || null,
+      department || null, classroom || null, room_id || null,
+    ];
+    if (purchase_date)   { cols.push('purchase_date');    vals.push(purchase_date); }
+    if (warranty_expiry) { cols.push('warranty_expiry');  vals.push(warranty_expiry); }
+    if (end_of_life_date){ cols.push('end_of_life_date'); vals.push(end_of_life_date); }
+
+    const placeholders = vals.map((_, i) => `$${i + 1}`).join(',');
     const result = await query(
-      `INSERT INTO products
-         (user_id, category_id, name, sku, barcode, description, tags, quantity, price, storage_location, photo_url, status, specifications, department, classroom, room_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-       RETURNING *`,
-      [
-        req.user.id, type || null, name, sku,
-        resolvedBarcode, description || null,
-        tagsArray ? `{${tagsArray.join(",")}}` : null,
-        quantity || 0, price || null, storage_location || null, photoUrl,
-        status || 'in_stock',
-        specsJson || null,
-        department || null, classroom || null, room_id || null,
-      ]
+      `INSERT INTO products (${cols.join(',')}) VALUES (${placeholders}) RETURNING *`,
+      vals
     );
     const product = result.rows[0];
 
@@ -229,6 +237,7 @@ const updateProduct = async (req, res, next) => {
       name, sku: manualSku, type, barcode,
       description, tags, quantity, price, storage_location, status, specifications,
       department, classroom, room_id, rfid_tag, ble_device,
+      purchase_date, warranty_expiry, end_of_life_date,
     } = req.body;
 
     const existing = await query(
@@ -275,8 +284,10 @@ const updateProduct = async (req, res, next) => {
        SET name=$1, sku=$2, category_id=$3, barcode=$4, description=$5,
            tags=$6, quantity=$7, price=$8, storage_location=$9, photo_url=$10,
            status=$11, specifications=$12, department=$13, classroom=$14,
-           room_id=$15, rfid_tag=$16, ble_device=$17, updated_at=NOW()
-       WHERE id=$18
+           room_id=$15, rfid_tag=$16, ble_device=$17,
+           purchase_date=$18, warranty_expiry=$19, end_of_life_date=$20,
+           updated_at=NOW()
+       WHERE id=$21
        RETURNING *`,
       [
         name, manualSku || existing.rows[0].sku, type || null,
@@ -292,10 +303,37 @@ const updateProduct = async (req, res, next) => {
         room_id !== undefined ? (room_id || null) : existing.rows[0].room_id,
         rfid_tag !== undefined ? (rfid_tag || null) : existing.rows[0].rfid_tag,
         ble_device !== undefined ? (ble_device || null) : existing.rows[0].ble_device,
+        purchase_date !== undefined ? (purchase_date || null) : existing.rows[0].purchase_date,
+        warranty_expiry !== undefined ? (warranty_expiry || null) : existing.rows[0].warranty_expiry,
+        end_of_life_date !== undefined ? (end_of_life_date || null) : existing.rows[0].end_of_life_date,
         req.params.id,
       ]
     );
-    res.json({ success: true, data: result.rows[0] });
+
+    // Low stock alert: notify magaziniers when quantity drops to threshold or below
+    const updated = result.rows[0];
+    const oldQty  = existing.rows[0].quantity;
+    const newQty  = updated.quantity;
+    const threshold = updated.low_stock_threshold ?? 1;
+    if (newQty <= threshold && oldQty > threshold) {
+      const magaziniers = await query(
+        "SELECT id FROM users WHERE role = 'magazinier' AND is_active = true"
+      );
+      const alertBody = `${updated.name} (${updated.sku}) is low on stock — only ${newQty} remaining.`;
+      for (const m of magaziniers.rows) {
+        await query(
+          `INSERT INTO notifications (user_id, type, title, body, product_id, product_name)
+           VALUES ($1,'low_stock','Low Stock Alert',$2,$3,$4)`,
+          [m.id, alertBody, updated.id, updated.name]
+        ).catch(() => {});
+        wsService.sendToUser(m.id, {
+          type: 'low_stock', title: 'Low Stock Alert',
+          body: alertBody, productId: updated.id, productName: updated.name,
+        });
+      }
+    }
+
+    res.json({ success: true, data: updated });
   } catch (err) {
     next(err);
   }
@@ -435,6 +473,29 @@ const updateProductStatus = async (req, res, next) => {
       "INSERT INTO scan_history (user_id, product_id, action_type, action_data) VALUES ($1, $2, 'status_changed', $3)",
       [req.user.id, req.params.id, JSON.stringify({ old_status: oldStatus, new_status: status })]
     ).catch(() => {});
+
+    // Alert admins + techniciens for critical/lost items
+    if (status === 'critical_issue' || status === 'lost') {
+      const product = result.rows[0];
+      const alertTitle = status === 'lost' ? 'Item Reported Lost' : 'Critical Issue Detected';
+      const alertBody  = `${product.name} (${product.sku}) has been marked as ${status.replace('_', ' ')}.`;
+      const alertType  = status === 'lost' ? 'product_lost' : 'product_critical';
+      const staff = await query(
+        "SELECT id FROM users WHERE role IN ('admin','technicien') AND is_active = true"
+      );
+      for (const s of staff.rows) {
+        const notif = await query(
+          `INSERT INTO notifications (user_id, type, title, body, product_id, product_name)
+           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+          [s.id, alertType, alertTitle, alertBody, product.id, product.name]
+        ).catch(() => ({ rows: [{}] }));
+        wsService.sendToUser(s.id, {
+          type: alertType, notificationId: notif.rows[0]?.id,
+          productId: product.id, productName: product.name,
+          title: alertTitle, body: alertBody,
+        });
+      }
+    }
 
     // Notify all magaziniers when an item is retired
     if (status === 'retired') {
@@ -795,10 +856,303 @@ const assignRfidTag = async (req, res, next) => {
   }
 };
 
+// GET /api/products/warranty-alerts  — items with warranty expiring within 30 days or already expired
+const getWarrantyAlerts = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT ${PRODUCT_SELECT},
+         p.purchase_date, p.warranty_expiry, p.end_of_life_date,
+         CASE
+           WHEN p.warranty_expiry < NOW()                             THEN 'expired'
+           WHEN p.warranty_expiry <= NOW() + INTERVAL '30 days'       THEN 'expiring_soon'
+           ELSE 'ok'
+         END AS warranty_status
+       FROM products p ${PRODUCT_JOINS}
+       WHERE p.warranty_expiry IS NOT NULL
+         AND p.warranty_expiry <= NOW() + INTERVAL '30 days'
+       ORDER BY p.warranty_expiry ASC`,
+      []
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) { next(err); }
+};
+
+// POST /api/products/import  — bulk import from CSV
+const importProducts = async (req, res, next) => {
+  try {
+    if (!req.body.csv || typeof req.body.csv !== 'string') {
+      return res.status(400).json({ success: false, message: 'csv field required' });
+    }
+
+    const lines = req.body.csv.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) {
+      return res.status(400).json({ success: false, message: 'CSV must have a header row and at least one data row' });
+    }
+
+    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const required = ['name'];
+    const missing = required.filter(r => !headers.includes(r));
+    if (missing.length) {
+      return res.status(400).json({ success: false, message: `Missing columns: ${missing.join(', ')}` });
+    }
+
+    const col = (row, name) => {
+      const idx = headers.indexOf(name);
+      return idx >= 0 ? (row[idx] || '').trim() : '';
+    };
+
+    let imported = 0, skipped = 0;
+    const errors = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      const row = lines[i].split(',');
+      const name = col(row, 'name');
+      if (!name) { skipped++; continue; }
+
+      try {
+        let sku = col(row, 'sku');
+        if (sku) {
+          const unique = await validateSKU(sku);
+          if (!unique) { errors.push(`Row ${i}: SKU "${sku}" already exists`); skipped++; continue; }
+        } else {
+          const catName = col(row, 'category') || 'GEN';
+          sku = await generateSKU(null, catName.substring(0, 3).toUpperCase());
+        }
+
+        const qty   = parseInt(col(row, 'quantity'), 10) || 0;
+        const price = parseFloat(col(row, 'price'))  || null;
+        const status = col(row, 'status') || 'in_stock';
+        const desc   = col(row, 'description') || null;
+        const barcode = col(row, 'barcode') || null;
+        const purchaseDate  = col(row, 'purchase_date')   || null;
+        const warrantyExpiry = col(row, 'warranty_expiry') || null;
+        const eol = col(row, 'end_of_life_date') || null;
+
+        const ins = await query(
+          `INSERT INTO products (user_id, name, sku, barcode, description, quantity, price, status, purchase_date, warranty_expiry, end_of_life_date)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id`,
+          [req.user.id, name, sku, barcode, desc, qty, price, status, purchaseDate, warrantyExpiry, eol]
+        );
+
+        // Generate QR
+        const prodId   = ins.rows[0].id;
+        const qrData   = `${process.env.APP_URL}/api/products/scan?id=${prodId}`;
+        const qrBuf    = await QRCode.toBuffer(qrData, { width: 300 });
+        const qrFile   = `${prodId}.png`;
+        fs.writeFileSync(path.join(QR_DIR, qrFile), qrBuf);
+        await query("UPDATE products SET qr_data=$1, qr_image_url=$2 WHERE id=$3",
+          [qrData, `/uploads/qr/${qrFile}`, prodId]);
+
+        imported++;
+      } catch (e) {
+        errors.push(`Row ${i}: ${e.message}`);
+        skipped++;
+      }
+    }
+
+    res.json({ success: true, data: { imported, skipped, errors } });
+  } catch (err) { next(err); }
+};
+
+// GET /api/products/:id/health  — calculate equipment health score 0-100
+const getProductHealth = async (req, res, next) => {
+  try {
+    const id = req.params.id;
+
+    const [prodRes, maintRes] = await Promise.all([
+      query(
+        `SELECT p.status, p.created_at, p.warranty_expiry, p.updated_at
+         FROM products p WHERE p.id = $1`, [id]
+      ),
+      query(
+        `SELECT COUNT(*) AS cnt
+         FROM maintenance_tasks
+         WHERE product_id = $1
+           AND created_at >= NOW() - INTERVAL '3 months'`, [id]
+      ),
+    ]);
+
+    if (!prodRes.rows.length) return res.status(404).json({ success: false, message: 'Not found' });
+
+    const p        = prodRes.rows[0];
+    const maintCnt = Number(maintRes.rows[0].cnt);
+    const ageYears = (Date.now() - new Date(p.created_at).getTime()) / (1000 * 60 * 60 * 24 * 365);
+    const now      = new Date();
+
+    let score = 100;
+    let reasons = [];
+
+    // Status deductions
+    if (p.status === 'critical_issue') { score -= 40; reasons.push('Critical issue reported'); }
+    else if (p.status === 'lost')      { score -= 60; reasons.push('Item is lost'); }
+    else if (p.status === 'in_maintenance') { score -= 20; reasons.push('Under maintenance'); }
+    else if (p.status === 'retired')   { score -= 80; reasons.push('Item retired'); }
+
+    // Age deductions
+    if (ageYears > 5)      { score -= 20; reasons.push('Over 5 years old'); }
+    else if (ageYears > 2) { score -= 10; reasons.push('Over 2 years old'); }
+
+    // Warranty deductions
+    if (p.warranty_expiry && new Date(p.warranty_expiry) < now) {
+      score -= 15;
+      reasons.push('Warranty expired');
+    }
+
+    // Maintenance frequency deductions
+    if (maintCnt > 3)      { score -= 15; reasons.push('Frequent maintenance (3+ times in 3 months)'); }
+    else if (maintCnt > 0) { score -= 5;  reasons.push(`${maintCnt} maintenance task(s) recently`); }
+
+    score = Math.max(0, Math.min(100, score));
+
+    let label;
+    if      (score >= 80) label = 'Excellent';
+    else if (score >= 60) label = 'Good';
+    else if (score >= 40) label = 'Fair';
+    else if (score >= 20) label = 'Poor';
+    else                  label = 'Critical';
+
+    res.json({ success: true, data: { score, label, reasons, age_years: Math.round(ageYears * 10) / 10 } });
+  } catch (err) { next(err); }
+};
+
+// GET /api/products/:id/activity  — full timeline for one product
+const getProductActivity = async (req, res, next) => {
+  try {
+    const id = req.params.id;
+
+    const [scans, maint] = await Promise.all([
+      // Scan/move/status history
+      query(
+        `SELECT sh.scanned_at AS at, sh.action_type AS type, sh.action_data,
+                u.name AS user_name, u.role AS user_role
+         FROM scan_history sh
+         LEFT JOIN users u ON u.id = sh.user_id
+         WHERE sh.product_id = $1
+         ORDER BY sh.scanned_at DESC LIMIT 100`,
+        [id]
+      ),
+      // Maintenance tasks
+      query(
+        `SELECT m.created_at AS at, 'maintenance' AS type, m.title, m.status, m.priority,
+                a.name AS assigned_name
+         FROM maintenance_tasks m
+         LEFT JOIN users a ON a.id = m.assigned_to
+         WHERE m.product_id = $1
+         ORDER BY m.created_at DESC LIMIT 50`,
+        [id]
+      ),
+    ]);
+
+    const ACTION_LABEL = {
+      scan:           'QR Scanned',
+      product_added:  'Product Added',
+      moved:          'Location Changed',
+      status_changed: 'Status Changed',
+      dept_qr:        'Department Scanned',
+    };
+
+    const events = [
+      ...scans.rows.map(r => ({
+        at:       r.at,
+        kind:     'scan',
+        type:     r.type,
+        label:    ACTION_LABEL[r.type] || r.type,
+        detail:   r.action_data ? (() => { try { return JSON.parse(r.action_data); } catch { return {}; } })() : {},
+        userName: r.user_name,
+        userRole: r.user_role,
+      })),
+      ...maint.rows.map(r => ({
+        at:       r.at,
+        kind:     'maintenance',
+        type:     'maintenance',
+        label:    `Maintenance: ${r.title}`,
+        detail:   { status: r.status, priority: r.priority },
+        userName: r.assigned_name,
+      })),
+    ].sort((a, b) => new Date(b.at) - new Date(a.at));
+
+    res.json({ success: true, data: events });
+  } catch (err) { next(err); }
+};
+
+// GET /api/products/export  — download filtered inventory as CSV
+const exportProducts = async (req, res, next) => {
+  try {
+    const { status, department, room_id, search } = req.query;
+    const params = [];
+    let where = '1=1';
+    let idx = 1;
+
+    if (status)     { where += ` AND p.status = $${idx++}`;    params.push(status); }
+    if (room_id)    { where += ` AND p.room_id = $${idx++}`;   params.push(room_id); }
+    if (department) { where += ` AND d.code = $${idx++}`;      params.push(department); }
+    if (search) {
+      where += ` AND (p.name ILIKE $${idx} OR p.sku ILIKE $${idx} OR p.barcode ILIKE $${idx})`;
+      params.push(`%${search}%`); idx++;
+    }
+
+    const result = await query(
+      `SELECT p.name, p.sku, p.barcode, p.status, p.quantity, p.price,
+              p.description, p.purchase_date, p.warranty_expiry, p.end_of_life_date,
+              c.name AS category, r.name AS room, d.code AS dept_code, d.name AS dept_name
+       FROM products p ${PRODUCT_JOINS}
+       WHERE ${where}
+       ORDER BY p.name`,
+      params
+    );
+
+    const headers = ['name','sku','barcode','status','quantity','price','description',
+                     'category','room','dept_code','dept_name',
+                     'purchase_date','warranty_expiry','end_of_life_date'];
+    const escape  = (v) => {
+      if (v == null) return '';
+      const s = String(v);
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const rows = [headers.join(',')];
+    for (const r of result.rows) {
+      rows.push(headers.map(h => escape(r[h])).join(','));
+    }
+
+    const csv = rows.join('\n');
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="inventory_export.csv"');
+    res.send('﻿' + csv); // BOM for Excel UTF-8
+  } catch (err) { next(err); }
+};
+
+// POST /api/products/ble-lookup
+// Body: { macs: ["aa:bb:...", ...] }
+const bleLookup = async (req, res, next) => {
+  try {
+    const { macs } = req.body;
+    if (!Array.isArray(macs) || macs.length === 0) {
+      return res.json({ success: true, data: [] });
+    }
+    const lower = macs.map((m) => m.toLowerCase());
+    const result = await query(
+      `SELECT p.id, p.name, p.sku, p.status, p.ble_device,
+              r.name AS room_name, d.name AS dept_name
+       FROM products p
+       LEFT JOIN rooms r ON r.id = p.room_id
+       LEFT JOIN departments d ON d.id = r.department_id
+       WHERE LOWER(p.ble_device) = ANY($1::text[])`,
+      [lower]
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    next(err);
+  }
+};
+
 module.exports = {
   getProducts, getProduct, getProductByScan, getProductByRfid,
   createProduct, updateProduct, updateProductStatus, updateProductLocation, deleteProduct,
   getProductQR, getCategories, getMoveLog,
   addScanHistory, getScanHistory, getStats,
   checkBarcode, getDeptStats, assignRfidTag,
+  getWarrantyAlerts, importProducts, exportProducts, getProductActivity, getProductHealth,
+  bleLookup,
 };

@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser, adminCreateUser } = require("../controllers/authController");
+const { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser, adminCreateUser, listStaff } = require("../controllers/authController");
 const { authenticate, authorize } = require("../middleware/auth");
 const upload = require("../middleware/upload");
 const { body } = require("express-validator");
@@ -50,6 +50,7 @@ router.post("/logout", logout);
 router.get("/me", authenticate, me);
 router.put("/profile", authenticate, upload.single("avatar"), updateProfile);
 router.get("/users", authenticate, authorize("admin"), listUsers);
+router.get("/staff", authenticate, authorize("admin","technicien"), listStaff);
 router.post("/users", authenticate, authorize("admin"), adminCreateUser);
 router.patch("/users/:id/role", authenticate, authorize("admin"), updateUserRole);
 router.patch("/users/:id/status", authenticate, authorize("admin"), toggleUserStatus);

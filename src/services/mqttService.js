@@ -77,7 +77,7 @@ const connect = () => {
         return;
       }
 
-      // inventory/devices/{readerId}/status — update device table
+      // inventory/devices/{readerId}/status — update device table + push BLE MAC list on connect
       const invParts = topic.split("/");
       if (invParts[0] === "inventory" && invParts[1] === "devices" && invParts[3] === "status") {
         const readerId = invParts[2];
@@ -85,6 +85,18 @@ const connect = () => {
           "UPDATE devices SET status = $1, last_seen = NOW() WHERE mqtt_topic LIKE $2",
           [payload.status || "online", `%${readerId}%`]
         );
+
+        // When a reader comes online, push all known BLE MACs so it can filter scans
+        if (payload.status === "online") {
+          const macsRes = await query(
+            `SELECT ble_device FROM products
+             WHERE ble_device IS NOT NULL AND tracker_active = true`
+          );
+          const macs = macsRes.rows.map((r) => r.ble_device.toLowerCase());
+          const configTopic = `inventory/devices/${readerId}/config`;
+          publish(configTopic, { ble_macs: macs });
+          console.log(`📡 Pushed ${macs.length} BLE MAC(s) to ${configTopic}`);
+        }
         return;
       }
 

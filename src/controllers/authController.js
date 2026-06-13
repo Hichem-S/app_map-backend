@@ -135,7 +135,7 @@ const login = async (req, res, next) => {
     const { email, password } = req.body;
 
     const result = await query(
-      "SELECT * FROM users WHERE email = $1 AND is_active = true AND google_id IS NULL",
+      "SELECT id, name, email, role, avatar, phone, password, email_verified, is_active FROM users WHERE email = $1 AND is_active = true AND google_id IS NULL",
       [email]
     );
     if (!result.rows.length) {
@@ -561,4 +561,19 @@ const adminCreateUser = async (req, res, next) => {
   }
 };
 
-module.exports = { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser, adminCreateUser };
+// GET /api/auth/staff  — active admins + techniciens, for task assignment (accessible to both roles)
+const listStaff = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT id, name, email, role, avatar
+       FROM users
+       WHERE role IN ('admin','technicien') AND is_active = true
+       ORDER BY name ASC`
+    );
+    res.json({ success: true, data: result.rows });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { register, login, googleAuth, refresh, logout, me, updateProfile, forgotPassword, resetPassword, verifyEmail, resendVerification, listUsers, updateUserRole, toggleUserStatus, deleteUser, adminCreateUser, listStaff };

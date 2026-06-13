@@ -18,42 +18,72 @@ const messageRoutes = require("./routes/messages");
 const aiRoutes         = require("./routes/ai");
 const checkoutRoutes   = require("./routes/checkouts");
 const maintenanceRoutes = require("./routes/maintenance");
+const analyticsRoutes   = require("./routes/analytics");
+const transferRoutes    = require("./routes/transfers");
 const { errorHandler, notFound } = require("./middleware/errorHandler");
 
 const app = express();
 
-// Security
-app.use(helmet());
+// ── Security headers ──────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "same-site" },
+}));
 
-// CORS — allow Flutter app (adjust origin in production)
+// ── CORS ──────────────────────────────────────────────────────────────────────
+// Production: set CORS_ORIGIN to your app domain. Never leave as * in prod.
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "*",
-    methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+    origin: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
 
-// Static files (uploads) — served BEFORE rate limiter so image loads don't count against the API limit
-app.use("/uploads", express.static(path.join(__dirname, "..", "uploads")));
+// ── Static file serving (uploads) ────────────────────────────────────────────
+// Served before rate limiter so image loads don't consume API quota.
+// nosniff + attachment headers prevent browser execution of uploaded content.
+app.use("/uploads", (req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Disposition", "attachment");
+  next();
+}, express.static(path.join(__dirname, "..", "uploads")));
 
-// Rate limiting — applies to API routes only
-app.use(
-  rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 500,
-    message: { success: false, message: "Too many requests, please try again later." },
-  })
-);
+// ── Rate limiting ─────────────────────────────────────────────────────────────
+// General API limit
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many requests, please try again later." },
+});
 
-// Body parsing
-app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true }));
+// Strict limit for auth endpoints (brute-force protection)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many auth attempts, please try again later." },
+});
 
-// Logging
+app.use("/api/auth/login",           authLimiter);
+app.use("/api/auth/register",        authLimiter);
+app.use("/api/auth/forgot-password", authLimiter);
+app.use("/api/auth/reset-password",  authLimiter);
+app.use("/api/auth/verify-email",    authLimiter);
+app.use(apiLimiter);
+
+// ── Body parsing ──────────────────────────────────────────────────────────────
+// 1mb is sufficient for JSON payloads; file uploads go through multer instead
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// ── Logging ───────────────────────────────────────────────────────────────────
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// Health check
+// ── Health check ──────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     success: true,
@@ -63,7 +93,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-// API Routes
+// ── API Routes ────────────────────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
 app.use("/api/devices", deviceRoutes);
 app.use("/api/products", productRoutes);
@@ -76,8 +106,10 @@ app.use("/api/messages", messageRoutes);
 app.use("/api/ai",          aiRoutes);
 app.use("/api/checkouts",   checkoutRoutes);
 app.use("/api/maintenance", maintenanceRoutes);
+app.use("/api/analytics",  analyticsRoutes);
+app.use("/api/transfers",  transferRoutes);
 
-// 404 & Error handlers
+// ── Error handlers ────────────────────────────────────────────────────────────
 app.use(notFound);
 app.use(errorHandler);
 
