@@ -395,24 +395,11 @@ const updateProductLocation = async (req, res, next) => {
       movedByName: moverName,
     };
 
-    // Self-notification (mover's own record)
-    const selfNotif = await query(
-      `INSERT INTO notifications
-         (user_id, type, title, body, product_id, product_name, from_room, to_room)
-       VALUES ($1, 'product_moved', 'Déplacement effectué', $2, $3, $4, $5, $6)
-       RETURNING id`,
-      [req.user.id, `By ${moverName}`,
-       prod.id, prod.name, old.room_name || null, prod.room_name || null]
-    );
-    wsService.sendToUser(req.user.id, {
-      ...wsPayload, notificationId: selfNotif.rows[0].id,
-    });
-
-    // Notify every technicien + admin who didn't perform the move
+    // Notify every technicien + admin (including the mover if they are one)
     const recipients = await query(
       `SELECT id FROM users
-       WHERE role IN ('technicien', 'admin') AND id != $1 AND is_active = true`,
-      [req.user.id]
+       WHERE role IN ('technicien', 'admin') AND is_active = true`,
+      []
     );
 
     for (const r of recipients.rows) {
@@ -780,17 +767,27 @@ const getMoveLog = async (req, res, next) => {
     const result = await query(
       `SELECT
          p.id, p.name, p.sku, p.status,
-         p.last_moved_at,
+         sh.created_at AS last_moved_at,
          r.id   AS room_id,   r.name AS room_name,
          d.id   AS dept_id,   d.name AS dept_name,
          d.code AS dept_code, d.color AS dept_color,
-         u.name AS moved_by_name, u.role AS moved_by_role
-       FROM products p
-       LEFT JOIN rooms r ON r.id = p.room_id
+         u.name AS moved_by_name, u.role AS moved_by_role,
+         (sh.action_data::jsonb)->>'from_room' AS from_room,
+         (sh.action_data::jsonb)->>'to_room'   AS to_room,
+         CASE WHEN sh.action_type = 'iot_scan' THEN 'rfid' ELSE 'manual' END AS move_source
+       FROM scan_history sh
+       JOIN products p ON p.id = sh.product_id
+       LEFT JOIN rooms r ON r.id = CASE
+         WHEN (sh.action_data::jsonb)->>'to_room_id' IS NOT NULL
+           THEN ((sh.action_data::jsonb)->>'to_room_id')::uuid
+         ELSE (SELECT r2.id FROM rooms r2 WHERE r2.name = (sh.action_data::jsonb)->>'to_room' LIMIT 1)
+       END
        LEFT JOIN departments d ON d.id = r.department_id
-       LEFT JOIN users u ON u.id = p.last_moved_by
-       WHERE p.last_moved_at IS NOT NULL
-       ORDER BY p.last_moved_at DESC`,
+       LEFT JOIN users u ON u.id = sh.user_id
+       WHERE sh.action_type = 'moved'
+          OR (sh.action_type = 'iot_scan' AND ((sh.action_data::jsonb)->>'moved')::boolean = true)
+       ORDER BY sh.created_at DESC
+       LIMIT 500`,
       []
     );
     res.json({ success: true, data: result.rows });
@@ -850,7 +847,30 @@ const assignRfidTag = async (req, res, next) => {
     if (!result.rows.length) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
-    res.json({ success: true, data: result.rows[0] });
+
+    // Auto-resolve unregistered scans and broadcast so IoT live feed updates instantly
+    const product = result.rows[0];
+    for (const uid of [rfid_tag, ble_device].filter(Boolean)) {
+      const resolved = await query(
+        `UPDATE unregistered_scans
+         SET resolved = TRUE, resolved_by = $1, resolved_at = NOW(), product_id = $2
+         WHERE uid = $3 AND resolved = FALSE
+         RETURNING id`,
+        [req.user.id, req.params.id, uid]
+      );
+      if (resolved.rowCount > 0) {
+        wsService.broadcast({
+          type:         'tag_assigned',
+          uid,
+          product_id:   product.id,
+          product_name: product.name,
+          assigned_by:  req.user.name,
+          timestamp:    new Date().toISOString(),
+        });
+      }
+    }
+
+    res.json({ success: true, data: product });
   } catch (err) {
     next(err);
   }
@@ -878,18 +898,39 @@ const getWarrantyAlerts = async (req, res, next) => {
 };
 
 // POST /api/products/import  — bulk import from CSV
+const parseCSVLine = (line) => {
+  const fields = [];
+  let cur = '', inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+      else if (ch === '"') { inQuotes = false; }
+      else { cur += ch; }
+    } else {
+      if (ch === '"') { inQuotes = true; }
+      else if (ch === ',') { fields.push(cur.trim()); cur = ''; }
+      else { cur += ch; }
+    }
+  }
+  fields.push(cur.trim());
+  return fields;
+};
+
 const importProducts = async (req, res, next) => {
   try {
     if (!req.body.csv || typeof req.body.csv !== 'string') {
       return res.status(400).json({ success: false, message: 'csv field required' });
     }
 
-    const lines = req.body.csv.split('\n').map(l => l.trim()).filter(Boolean);
+    // Strip BOM and normalize line endings
+    const raw = req.body.csv.replace(/^﻿/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
     if (lines.length < 2) {
       return res.status(400).json({ success: false, message: 'CSV must have a header row and at least one data row' });
     }
 
-    const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+    const headers = parseCSVLine(lines[0]).map(h => h.toLowerCase());
     const required = ['name'];
     const missing = required.filter(r => !headers.includes(r));
     if (missing.length) {
@@ -905,7 +946,7 @@ const importProducts = async (req, res, next) => {
     const errors = [];
 
     for (let i = 1; i < lines.length; i++) {
-      const row = lines[i].split(',');
+      const row = parseCSVLine(lines[i]);
       const name = col(row, 'name');
       if (!name) { skipped++; continue; }
 

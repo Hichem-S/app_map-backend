@@ -38,11 +38,14 @@ const getConversations = async (req, res, next) => {
           AND m.sender_id != $1
          ) AS unread_count,
          (SELECT json_agg(json_build_object(
-             'id', u.id, 'name', u.name, 'avatar', u.avatar, 'role', u.role
+             'id', cm3.user_id,
+             'name', COALESCE(u.name, 'Deleted User'),
+             'avatar', u.avatar,
+             'role', COALESCE(u.role, 'user')
            ))
           FROM chat_members cm3
-          JOIN users u ON u.id = cm3.user_id
-          WHERE cm3.conversation_id = c.id AND u.id != $1
+          LEFT JOIN users u ON u.id = cm3.user_id
+          WHERE cm3.conversation_id = c.id AND cm3.user_id != $1
          ) AS other_members
        FROM chat_conversations c
        JOIN chat_members mb ON mb.conversation_id = c.id AND mb.user_id = $1
@@ -51,11 +54,67 @@ const getConversations = async (req, res, next) => {
          c.created_at DESC`,
       [userId]
     );
-    res.json({ success: true, data: result.rows });
+
+    const rows = result.rows;
+
+    // Auto-repair: if a direct conversation has no other_members but has messages
+    // from another user, restore that user into chat_members and return their info.
+    for (const row of rows) {
+      if (row.other_members || row.type !== 'direct') continue;
+      const senderId = row.last_message?.sender_id;
+      if (!senderId || senderId === userId) continue;
+
+      const userRes = await query(
+        `SELECT id, name, avatar, role FROM users WHERE id = $1`,
+        [senderId]
+      );
+      if (!userRes.rows.length) continue;
+
+      // Restore the missing chat_members row so future queries work natively
+      await query(
+        `INSERT INTO chat_members (conversation_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+        [row.id, senderId]
+      );
+      row.other_members = [userRes.rows[0]];
+    }
+
+    res.json({ success: true, data: rows });
   } catch (err) {
     next(err);
   }
 };
+
+// Helper – fetch a single conversation with full details (same shape as getConversations)
+const _fetchConv = (convId, userId) =>
+  query(
+    `SELECT
+       c.id, c.type, c.name, c.created_at,
+       (SELECT row_to_json(m)
+        FROM (SELECT cm2.content, cm2.sender_id, cm2.created_at
+              FROM chat_messages cm2
+              WHERE cm2.conversation_id = c.id
+              ORDER BY cm2.created_at DESC LIMIT 1) m
+       ) AS last_message,
+       (SELECT COUNT(*)::int FROM chat_messages m
+        WHERE m.conversation_id = c.id
+          AND m.created_at > COALESCE(mb.last_read_at, '1970-01-01'::timestamp)
+          AND m.sender_id != $2
+       ) AS unread_count,
+       (SELECT json_agg(json_build_object(
+           'id', cm3.user_id,
+           'name', COALESCE(u.name, 'Deleted User'),
+           'avatar', u.avatar,
+           'role', COALESCE(u.role, 'user')
+         ))
+        FROM chat_members cm3
+        LEFT JOIN users u ON u.id = cm3.user_id
+        WHERE cm3.conversation_id = c.id AND cm3.user_id != $2
+       ) AS other_members
+     FROM chat_conversations c
+     JOIN chat_members mb ON mb.conversation_id = c.id AND mb.user_id = $2
+     WHERE c.id = $1`,
+    [convId, userId]
+  );
 
 // POST /api/messages/conversations
 const createConversation = async (req, res, next) => {
@@ -80,24 +139,26 @@ const createConversation = async (req, res, next) => {
         [userId, other]
       );
       if (existing.rows.length) {
-        return res.json({ success: true, data: existing.rows[0] });
+        const full = await _fetchConv(existing.rows[0].id, userId);
+        return res.json({ success: true, data: full.rows[0] });
       }
     }
 
     const convRes = await query(
-      `INSERT INTO chat_conversations (type, name, created_by) VALUES ($1, $2, $3) RETURNING *`,
+      `INSERT INTO chat_conversations (type, name, created_by) VALUES ($1, $2, $3) RETURNING id`,
       [type, name || null, userId]
     );
-    const conv = convRes.rows[0];
+    const convId = convRes.rows[0].id;
 
     for (const mid of allMembers) {
       await query(
         `INSERT INTO chat_members (conversation_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-        [conv.id, mid]
+        [convId, mid]
       );
     }
 
-    res.status(201).json({ success: true, data: conv });
+    const full = await _fetchConv(convId, userId);
+    res.status(201).json({ success: true, data: full.rows[0] });
   } catch (err) {
     next(err);
   }
@@ -220,4 +281,27 @@ const markAsRead = async (req, res, next) => {
   }
 };
 
-module.exports = { getUsers, getConversations, createConversation, getMessages, sendMessage, markAsRead };
+// DELETE /api/messages/conversations/:id
+const deleteConversation = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    // Only members can delete
+    const member = await query(
+      "SELECT 1 FROM chat_members WHERE conversation_id = $1 AND user_id = $2",
+      [id, userId]
+    );
+    if (!member.rows.length) {
+      return res.status(403).json({ success: false, message: "Not a member" });
+    }
+
+    // Cascades delete messages and members automatically
+    await query("DELETE FROM chat_conversations WHERE id = $1", [id]);
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getUsers, getConversations, createConversation, getMessages, sendMessage, markAsRead, deleteConversation };

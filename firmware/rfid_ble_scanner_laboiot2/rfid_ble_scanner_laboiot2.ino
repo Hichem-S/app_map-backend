@@ -1,5 +1,6 @@
 /**
  * Smart Inventory — ESP32 RFID + BLE Scanner
+ * Room: Labo IoT 2
  *
  * Hardware:
  *   - ESP32 (any variant with SPI + built-in BLE)
@@ -41,8 +42,8 @@
 #define MQTT_BROKER     "172.20.10.6"
 #define MQTT_PORT       1883
 
-#define READER_ID       "esp32_labo_iot1"
-#define ROOM_ID         "e88f0c40-f527-4e8c-9bb8-9819c02a70b8"
+#define READER_ID       "esp32_labo_iot2"
+#define ROOM_ID         "2cef73e3-e196-4f76-b04b-eb642eeb01ea"
 
 // Match Apple Find My accessories by manufacturer data prefix (MAC rotates on Apple)
 #define BLE_MATCH_BY_ADV_PREFIX true

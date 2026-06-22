@@ -1,7 +1,21 @@
 const { query } = require("./database");
 require("dotenv").config();
 
+const waitForDB = async (retries = 20, delay = 3000) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      await query("SELECT 1");
+      return;
+    } catch {
+      console.log(`Waiting for database... (${i + 1}/${retries})`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error("Database not ready after max retries");
+};
+
 const migrate = async () => {
+  await waitForDB();
   try {
     // Users table
     await query(`
@@ -286,6 +300,10 @@ const migrate = async () => {
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_hashed_key TEXT;`);
     await query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_tracker_key ON products(tracker_hashed_key) WHERE tracker_hashed_key IS NOT NULL;`);
 
+    // ── Geofence alert state ──────────────────────────────────────────────────
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_outside_zone BOOLEAN DEFAULT false;`);
+    await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS tracker_alert_sent_at TIMESTAMP;`);
+
     // ── BLE device linking ────────────────────────────────────────────────────
     await query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ble_device VARCHAR(50);`);
     await query(`CREATE INDEX IF NOT EXISTS idx_products_ble ON products(ble_device) WHERE ble_device IS NOT NULL;`);
@@ -427,11 +445,14 @@ const migrate = async () => {
     await query(`ALTER TABLE maintenance_tasks ADD COLUMN IF NOT EXISTS recurrence_interval_days INTEGER;`);
 
     console.log("✅ Database migration completed");
-    process.exit(0);
   } catch (err) {
     console.error("❌ Migration failed:", err);
-    process.exit(1);
+    throw err;
   }
 };
 
-migrate();
+if (require.main === module) {
+  migrate().then(() => process.exit(0)).catch(() => process.exit(1));
+}
+
+module.exports = migrate;

@@ -1,10 +1,14 @@
 const Groq   = require("groq-sdk");
 const { query } = require("../config/database");
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+let _groq = null;
+const getGroq = () => {
+  if (!_groq) _groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  return _groq;
+};
 
 async function askGroq(prompt) {
-  const res = await groq.chat.completions.create({
+  const res = await getGroq().chat.completions.create({
     model:    "llama-3.1-8b-instant",
     messages: [{ role: "user", content: prompt }],
     temperature: 0.1,

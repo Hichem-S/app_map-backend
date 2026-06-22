@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const nodemailer = require("nodemailer");
 const { OAuth2Client } = require("google-auth-library");
 const { query } = require("../config/database");
+const wsService = require("../services/wsService");
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || "smtp.gmail.com",
@@ -86,12 +87,10 @@ const sendVerificationOtp = async (userId, email, name) => {
     }
   }
 
-  if (!emailSent) {
-    console.log(`\n========================================`);
-    console.log(`[OTP] Email: ${email}`);
-    console.log(`[OTP] Code:  ${otp}`);
-    console.log(`========================================\n`);
-  }
+  console.log(`\n========================================`);
+  console.log(`[OTP] Email: ${email}`);
+  console.log(`[OTP] Code:  ${otp}`);
+  console.log(`========================================\n`);
 
   const isDev = process.env.NODE_ENV !== "production";
   return { emailSent, devOtp: isDev && !emailSent ? otp : null };
@@ -111,7 +110,7 @@ const register = async (req, res, next) => {
 
     const hashed = await bcrypt.hash(password, 12);
     const result = await query(
-      "INSERT INTO users (name, email, password, role, email_verified) VALUES ($1, $2, $3, $4, false) RETURNING id, name, email, role",
+      "INSERT INTO users (name, email, password, role, email_verified, is_active) VALUES ($1, $2, $3, $4, false, false) RETURNING id, name, email, role",
       [name, email, hashed, userRole]
     );
 
@@ -135,18 +134,27 @@ const login = async (req, res, next) => {
     const { email, password } = req.body;
 
     const result = await query(
-      "SELECT id, name, email, role, avatar, phone, password, email_verified, is_active FROM users WHERE email = $1 AND is_active = true AND google_id IS NULL",
+      "SELECT id, name, email, role, avatar, phone, password, email_verified, is_active FROM users WHERE email = $1 AND google_id IS NULL",
       [email]
     );
     if (!result.rows.length) {
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
 
-    const user = result.rows[0];
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) {
+    const pendingCheck = result.rows[0];
+    const validPw = await bcrypt.compare(password, pendingCheck.password);
+    if (!validPw) {
       return res.status(401).json({ success: false, message: "Invalid credentials" });
     }
+    if (!pendingCheck.is_active) {
+      return res.status(403).json({
+        success: false,
+        requiresApproval: true,
+        message: "Your account is pending admin approval.",
+      });
+    }
+
+    const user = pendingCheck;
 
     if (!user.email_verified) {
       await sendVerificationOtp(user.id, user.email, user.name);
@@ -296,8 +304,9 @@ const verifyEmail = async (req, res, next) => {
   try {
     const { email, otp } = req.body;
 
+    // Allow inactive users (pending approval) to verify their email
     const userRes = await query(
-      "SELECT id, name, email, role, avatar, phone FROM users WHERE email = $1 AND is_active = true AND google_id IS NULL",
+      "SELECT id, name, email, role, avatar, phone, is_active FROM users WHERE email = $1 AND google_id IS NULL",
       [email]
     );
     if (!userRes.rows.length) {
@@ -319,6 +328,52 @@ const verifyEmail = async (req, res, next) => {
     await query("UPDATE users SET email_verified = true, updated_at = NOW() WHERE id = $1", [user.id]);
     await query("DELETE FROM email_verification_tokens WHERE user_id = $1", [user.id]);
 
+    // If account needs admin approval, notify all admins and return pending state
+    if (!user.is_active) {
+      const admins = await query("SELECT id, email, name FROM users WHERE role = 'admin' AND is_active = true");
+      const roleLabel = user.role === 'magazinier' ? 'Magazinier' : 'Technicien';
+      for (const admin of admins.rows) {
+        const notif = await query(
+          `INSERT INTO notifications (user_id, type, title, body)
+           VALUES ($1, 'account_pending', $2, $3) RETURNING id`,
+          [admin.id, 'New Account Request',
+           JSON.stringify({ text: `${user.name} registered as ${roleLabel} — tap to approve or reject.`, pendingUserId: user.id, pendingName: user.name, pendingEmail: user.email, pendingRole: user.role })]
+        );
+        wsService.sendToUser(admin.id, {
+          type:           'account_pending',
+          notificationId: notif.rows[0].id,
+          pendingUserId:  user.id,
+          pendingName:    user.name,
+          pendingEmail:   user.email,
+          pendingRole:    user.role,
+          timestamp:      new Date().toISOString(),
+        });
+        // Send email to admin
+        mailer.sendMail({
+          from: `"Smart Inventory" <${process.env.SMTP_USER}>`,
+          to: admin.email,
+          subject: `New Account Request — ${user.name}`,
+          html: `
+            <div style="font-family:sans-serif;max-width:520px;margin:0 auto;padding:24px;background:#f8f9ff;border-radius:12px">
+              <h2 style="color:#4A7CFC;margin-top:0">New Account Request</h2>
+              <p style="color:#374151">A new user has verified their email and is waiting for approval:</p>
+              <table style="width:100%;border-collapse:collapse;margin:16px 0">
+                <tr><td style="padding:8px 12px;background:#fff;border-radius:6px 6px 0 0;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:13px">Name</td>
+                    <td style="padding:8px 12px;background:#fff;border-radius:6px 6px 0 0;border-bottom:1px solid #e5e7eb;font-weight:600">${user.name}</td></tr>
+                <tr><td style="padding:8px 12px;background:#fff;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:13px">Email</td>
+                    <td style="padding:8px 12px;background:#fff;border-bottom:1px solid #e5e7eb;font-weight:600">${user.email}</td></tr>
+                <tr><td style="padding:8px 12px;background:#fff;border-radius:0 0 6px 6px;color:#6b7280;font-size:13px">Role</td>
+                    <td style="padding:8px 12px;background:#fff;border-radius:0 0 6px 6px;font-weight:600">${roleLabel}</td></tr>
+              </table>
+              <p style="color:#6b7280;font-size:13px">Open the Smart Inventory app and go to <strong>Notifications</strong> to approve or reject this account.</p>
+              <hr style="border:none;border-top:1px solid #e5e7eb;margin:20px 0"/>
+              <p style="color:#9ca3af;font-size:11px;margin:0">Smart Inventory · This email was sent to ${admin.email}</p>
+            </div>`,
+        }).catch(err => console.error('[email] Failed to send approval email:', err.message));
+      }
+      return res.json({ success: true, requiresApproval: true });
+    }
+
     const { accessToken, refreshToken } = generateTokens(user.id);
     await storeRefreshToken(user.id, refreshToken);
 
@@ -334,7 +389,7 @@ const resendVerification = async (req, res, next) => {
     const { email } = req.body;
 
     const userRes = await query(
-      "SELECT id, name FROM users WHERE email = $1 AND is_active = true AND email_verified = false AND google_id IS NULL",
+      "SELECT id, name FROM users WHERE email = $1 AND email_verified = false AND google_id IS NULL",
       [email]
     );
     if (!userRes.rows.length) {

@@ -5,6 +5,7 @@ const mqttService = require("./services/mqttService");
 const cron = require("node-cron");
 const { query } = require("./config/database");
 const { sendMail } = require("./services/emailService");
+const migrate = require("./config/migrate");
 require("dotenv").config();
 
 const PORT = process.env.PORT || 3000;
@@ -146,9 +147,18 @@ cron.schedule("0 7 1 * *", async () => {
   }
 });
 
-// Start server
-server.listen(PORT, () => {
-  console.log(`
+// Auto-free port if already in use (happens on nodemon restart)
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} in use — kill it with: Get-NetTCPConnection -LocalPort ${PORT} -State Listen | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force }`);
+    process.exit(1);
+  }
+});
+
+// Run migrations then start server
+migrate().then(() => {
+  server.listen(PORT, () => {
+    console.log(`
   ╔═══════════════════════════════════════╗
   ║     Flutter Backend Server Started    ║
   ╠═══════════════════════════════════════╣
@@ -156,17 +166,17 @@ server.listen(PORT, () => {
   ║  WS    : ws://localhost:${PORT}          ║
   ║  MQTT  : ${process.env.MQTT_BROKER_URL || "mqtt://localhost:1883"}  ║
   ╚═══════════════════════════════════════╝
-  `);
+    `);
+  });
+}).catch(err => {
+  console.error("❌ Startup migration failed:", err);
+  process.exit(1);
 });
 
-// Graceful shutdown
-process.on("SIGTERM", () => {
-  console.log("SIGTERM received. Shutting down gracefully...");
-  server.close(() => {
-    console.log("Server closed");
-    process.exit(0);
-  });
-});
+// Graceful shutdown — release port before nodemon restarts
+const _shutdown = () => server.close(() => process.exit(0));
+process.on('SIGTERM', _shutdown);
+process.on('SIGINT',  _shutdown);
 
 process.on("unhandledRejection", (err) => {
   console.error("Unhandled rejection:", err);

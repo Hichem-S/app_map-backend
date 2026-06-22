@@ -23,17 +23,20 @@ const getDashboard = async (req, res, next) => {
           ORDER BY count DESC
         `),
 
-        // Maintenance tasks created per month (last 6 months)
+        // Maintenance tasks per month — always 6 buckets even if empty
         query(`
           SELECT
-            TO_CHAR(DATE_TRUNC('month', created_at), 'Mon YY') AS month,
-            DATE_TRUNC('month', created_at) AS month_date,
-            COUNT(*) AS total,
-            COUNT(*) FILTER (WHERE status = 'done') AS done
-          FROM maintenance_tasks
-          WHERE created_at >= NOW() - INTERVAL '6 months'
-          GROUP BY month_date
-          ORDER BY month_date ASC
+            TO_CHAR(m, 'Mon YY') AS month,
+            COALESCE(COUNT(mt.id), 0)::int AS total,
+            COALESCE(COUNT(mt.id) FILTER (WHERE mt.status = 'done'), 0)::int AS done
+          FROM generate_series(
+            DATE_TRUNC('month', NOW() - INTERVAL '5 months'),
+            DATE_TRUNC('month', NOW()),
+            '1 month'
+          ) AS m
+          LEFT JOIN maintenance_tasks mt ON DATE_TRUNC('month', mt.created_at) = m
+          GROUP BY m
+          ORDER BY m ASC
         `),
 
         // Top 5 most maintained products

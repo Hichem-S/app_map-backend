@@ -3,7 +3,7 @@ const router   = express.Router();
 const { authenticate } = require("../middleware/auth");
 const {
   getUsers, getConversations, createConversation,
-  getMessages, sendMessage, markAsRead,
+  getMessages, sendMessage, markAsRead, deleteConversation,
 } = require("../controllers/messageController");
 
 router.use(authenticate);
@@ -14,5 +14,6 @@ router.post("/conversations",                createConversation);
 router.get("/conversations/:id",             getMessages);
 router.post("/conversations/:id",            sendMessage);
 router.patch("/conversations/:id/read",      markAsRead);
+router.delete("/conversations/:id",          deleteConversation);
 
 module.exports = router;

@@ -1,0 +1,74 @@
+services:
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: inventory_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-inventory-system}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-inventory-system}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── MQTT Broker (Mosquitto) ───────────────────────────────────────────────
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: inventory_mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mqtt_data:/mosquitto/data
+
+  # ── Backend API ───────────────────────────────────────────────────────────
+  backend:
+    build: .
+    container_name: inventory_backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mqtt:
+        condition: service_started
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-inventory-system}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-7d}
+      MQTT_BROKER_URL: mqtt://mqtt:1883
+      SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      SMTP_FROM: ${SMTP_FROM}
+      GEOFENCE_LAT: ${GEOFENCE_LAT:-35.5047}
+      GEOFENCE_LNG: ${GEOFENCE_LNG:-11.0622}
+      GEOFENCE_RADIUS: ${GEOFENCE_RADIUS:-300}
+      UPLOAD_DIR: uploads
+    volumes:
+      - uploads_data:/app/uploads
+
+volumes:
+  postgres_data:
+  mqtt_data:
+  uploads_data:

@@ -1,6 +1,6 @@
 const express = require("express");
 const router = express.Router();
-const { getDepartments, getDepartmentRooms, getDepartmentStats, getIsetQR, getDeptQR, getDeptQRByCode, getRoomQR, getDepartmentRoomsByCode, updateRoom, getMapData } = require("../controllers/departmentController");
+const { getDepartments, getDepartmentRooms, getDepartmentStats, getIsetQR, getDeptQR, getDeptQRByCode, getRoomQR, getDepartmentRoomsByCode, updateRoom, getMapData, getRoom } = require("../controllers/departmentController");
 const { authenticate } = require("../middleware/auth");
 
 // Public — QR images (no auth, needed for Image.network in Flutter)
@@ -13,6 +13,7 @@ router.use(authenticate);
 
 router.get("/", getDepartments);
 router.get("/map-data", getMapData);
+router.get("/rooms/:id", getRoom);
 router.get("/code/:code/rooms", getDepartmentRoomsByCode);
 router.get("/:id/rooms", getDepartmentRooms);
 router.get("/:id/stats", getDepartmentStats);

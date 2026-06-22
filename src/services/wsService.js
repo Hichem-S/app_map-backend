@@ -12,6 +12,10 @@ const AUTH_TIMEOUT_MS = 5000;
 const init = (server) => {
   wss = new WebSocket.Server({ server });
 
+  wss.on("error", (err) => {
+    if (err.code !== "EADDRINUSE") console.error("WebSocket server error:", err.message);
+  });
+
   wss.on("connection", (ws) => {
     console.log("🔌 WebSocket client connected");
 

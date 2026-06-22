@@ -315,4 +315,30 @@ const getMapData = async (req, res, next) => {
   }
 };
 
-module.exports = { getDepartments, getDepartmentRooms, getDepartmentStats, getIsetQR, getDeptQR, getDeptQRByCode, getRoomQR, getDepartmentRoomsByCode, updateRoom, getMapData };
+// GET /api/departments/rooms/:id  — single room + its department
+const getRoom = async (req, res, next) => {
+  try {
+    const result = await query(
+      `SELECT r.*,
+              d.id   AS department_id,
+              d.name AS department_name,
+              d.code AS department_code,
+              d.color AS department_color,
+              COUNT(p.id) AS product_count
+       FROM rooms r
+       JOIN departments d ON d.id = r.department_id
+       LEFT JOIN products p ON p.room_id = r.id
+       WHERE r.id = $1
+       GROUP BY r.id, d.id`,
+      [req.params.id]
+    );
+    if (!result.rows.length) {
+      return res.status(404).json({ success: false, message: 'Room not found' });
+    }
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    next(err);
+  }
+};
+
+module.exports = { getDepartments, getDepartmentRooms, getDepartmentStats, getIsetQR, getDeptQR, getDeptQRByCode, getRoomQR, getDepartmentRoomsByCode, updateRoom, getMapData, getRoom };

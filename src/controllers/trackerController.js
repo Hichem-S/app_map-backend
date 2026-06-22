@@ -1,5 +1,22 @@
 const { query } = require("../config/database");
 const wsService = require("../services/wsService");
+const mailer  = require("../services/emailService");
+
+// ISET Mahdia geofence (configurable via env)
+const ISET_LAT    = parseFloat(process.env.GEOFENCE_LAT    || "35.5047");
+const ISET_LNG    = parseFloat(process.env.GEOFENCE_LNG    || "11.0622");
+const ISET_RADIUS = parseFloat(process.env.GEOFENCE_RADIUS || "300");   // metres
+const ALERT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between repeat alerts
+
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = d => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 // GET /api/trackers
 const getTrackers = async (req, res, next) => {
@@ -36,18 +53,68 @@ const checkIn = async (req, res, next) => {
     const { id } = req.params;
     const { lat, lng, battery } = req.body;
 
+    const distanceM = haversineMeters(lat, lng, ISET_LAT, ISET_LNG);
+    const outsideZone = distanceM > ISET_RADIUS;
+
+    const prev = await query(
+      `SELECT name, sku, tracker_outside_zone, tracker_alert_sent_at FROM products WHERE id = $1`,
+      [id]
+    );
+    if (!prev.rows.length) return res.status(404).json({ success: false, message: "Product not found" });
+    const product = prev.rows[0];
+
     await query(
       `UPDATE products
-       SET tracker_lat        = $1,
-           tracker_lng        = $2,
-           tracker_battery    = $3,
-           tracker_checked_at = NOW(),
-           tracker_active     = true
-       WHERE id = $4`,
-      [lat, lng, battery !== undefined ? battery : null, id]
+       SET tracker_lat          = $1,
+           tracker_lng          = $2,
+           tracker_battery      = $3,
+           tracker_checked_at   = NOW(),
+           tracker_active       = true,
+           tracker_outside_zone = $4,
+           tracker_alert_sent_at = CASE WHEN $4 AND ($5::boolean = false OR $6::timestamp IS NULL OR NOW() - $6::timestamp > INTERVAL '1 hour') THEN NOW() ELSE tracker_alert_sent_at END
+       WHERE id = $7`,
+      [lat, lng, battery !== undefined ? battery : null, outsideZone,
+       product.tracker_outside_zone, product.tracker_alert_sent_at, id]
     );
 
-    res.json({ success: true });
+    // Fire alert if newly outside zone (or re-alert after cooldown)
+    const wasOutside   = product.tracker_outside_zone;
+    const lastAlert    = product.tracker_alert_sent_at ? new Date(product.tracker_alert_sent_at) : null;
+    const cooldownOver = !lastAlert || (Date.now() - lastAlert.getTime() > ALERT_COOLDOWN_MS);
+
+    if (outsideZone && (!wasOutside || cooldownOver)) {
+      const distKm = (distanceM / 1000).toFixed(2);
+      const recipients = await query(
+        `SELECT id, email, name FROM users WHERE role = 'admin' AND is_active = true`
+      );
+      for (const u of recipients.rows) {
+        const body = JSON.stringify({
+          text: `${product.name} (${product.sku}) is ${distKm} km from ISET — outside the allowed zone.`,
+          productId: id,
+          productName: product.name,
+          distanceKm: distKm,
+        });
+        await query(
+          `INSERT INTO notifications (user_id, type, title, body, product_id, product_name) VALUES ($1, 'tracker_zone_alert', $2, $3, $4, $5)`,
+          [u.id, `AirTag out of zone — ${product.name}`, body, id, product.name]
+        );
+        wsService.sendToUser(u.id, {
+          type: "tracker_zone_alert",
+          productId: id,
+          productName: product.name,
+          distanceKm: distKm,
+        });
+        mailer.sendMail(
+          u.email,
+          `⚠️ AirTag Alert — ${product.name} left ISET`,
+          `<p>Hi ${u.name},</p>
+           <p><strong>${product.name}</strong> (${product.sku}) was detected <strong>${distKm} km</strong> from ISET Mahdia — outside the ${ISET_RADIUS}m allowed zone.</p>
+           <p>Check the tracker screen in Smart Inventory for the live location.</p>`
+        ).catch(() => {});
+      }
+    }
+
+    res.json({ success: true, outsideZone, distanceMeters: Math.round(distanceM) });
   } catch (err) {
     next(err);
   }
